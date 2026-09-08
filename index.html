@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>סקאוטינג נוער — התאחדות לכדורגל</title>
+<link rel="stylesheet" href="/static/vendor/leaflet.css">
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <header class="brand">
+      <h1>סקאוטינג נוער</h1>
+      <p class="dataset" id="dataset">טוען נתונים…</p>
+    </header>
+
+    <div class="controls">
+      <label class="field search-field">
+        <span class="sr-only">חיפוש שחקן</span>
+        <input id="query" type="search" placeholder="חיפוש לפי שם, מועדון או מספר שחקן"
+               autocomplete="off" spellcheck="false">
+      </label>
+      <div class="filters">
+        <label class="checkbox">
+          <input id="above-age" type="checkbox">
+          <span>רק שחקנים המשחקים מעל הגיל</span>
+        </label>
+        <label class="field select-field">
+          <span class="sr-only">שנת לידה</span>
+          <select id="birth-year">
+            <option value="">כל שנות הלידה</option>
+          </select>
+        </label>
+        <label class="field select-field">
+          <span class="sr-only">קבוצה נוכחית</span>
+          <select id="current-team">
+            <option value="">כל הקבוצות</option>
+          </select>
+        </label>
+      </div>
+    </div>
+
+    <p class="results-meta" id="results-meta"></p>
+    <ul class="results" id="results"></ul>
+  </aside>
+
+  <main class="main">
+    <article class="player" id="player" hidden>
+      <header class="player-head">
+        <img class="player-photo" id="player-photo" alt="" hidden>
+        <div class="player-identity">
+          <h2 id="player-name"></h2>
+          <p class="player-meta" id="player-meta"></p>
+          <div class="badges" id="player-badges"></div>
+        </div>
+      </header>
+
+      <section class="tiles" id="tiles"></section>
+
+      <div class="panels">
+        <section class="panel map-panel">
+          <div class="panel-head">
+            <h3>מסלול הקבוצות</h3>
+            <p class="hint">סימון גדול = קבוצה מוקדמת יותר, סימון קטן = עדכנית יותר</p>
+          </div>
+          <div id="map"></div>
+          <div class="map-legend">
+            <span><i class="dot dot-early"></i> קבוצה מוקדמת (גדול)</span>
+            <span><i class="dot dot-current"></i> קבוצה נוכחית</span>
+            <span><i class="dot dot-above"></i> תקופה מעל הגיל</span>
+          </div>
+          <p class="unlocated" id="unlocated" hidden></p>
+        </section>
+
+        <section class="panel seasons-panel">
+          <div class="panel-head">
+            <h3>עונות</h3>
+            <p class="hint">מהעדכנית לראשונה</p>
+          </div>
+          <div class="table-scroll">
+            <table class="seasons">
+              <thead>
+                <tr>
+                  <th>עונה</th><th>קבוצה</th><th>קב׳ גיל</th>
+                  <th>מש׳</th><th>שערים</th><th>דקות</th><th>כרטיסים</th>
+                </tr>
+              </thead>
+              <tbody id="seasons-body"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+    </article>
+  </main>
+</div>
+
+<script src="/static/vendor/leaflet.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
