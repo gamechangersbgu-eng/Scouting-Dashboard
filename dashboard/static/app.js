@@ -11,6 +11,35 @@ const num = (value) => (value === null || value === undefined ? "—" : Number(v
 
 const state = { players: [], selected: null, map: null, layer: null, primed: false };
 
+function addLocationFilters() {
+  const filters = document.querySelector(".filters");
+  const location = document.createElement("label");
+  location.className = "field select-field";
+  location.innerHTML =
+    '<span class="sr-only">\u05d0\u05d6\u05d5\u05e8 \u05dc\u05d7\u05d9\u05e4\u05d5\u05e9</span>' +
+    '<select id="location"><option value="">\u05db\u05dc \u05d4\u05d0\u05e8\u05e5</option></select>';
+
+  const radius = document.createElement("label");
+  radius.className = "field select-field";
+  radius.innerHTML =
+    '<span class="sr-only">\u05e8\u05d3\u05d9\u05d5\u05e1 \u05d7\u05d9\u05e4\u05d5\u05e9</span>' +
+    '<select id="radius-km">' +
+    '<option value="10">\u05e2\u05d3 10 \u05e7\"\u05de</option>' +
+    '<option value="25">\u05e2\u05d3 25 \u05e7\"\u05de</option>' +
+    '<option value="50" selected>\u05e2\u05d3 50 \u05e7\"\u05de</option>' +
+    '<option value="100">\u05e2\u05d3 100 \u05e7\"\u05de</option>' +
+    '</select>';
+
+  const hint = document.createElement("p");
+  hint.className = "filter-hint";
+  hint.textContent =
+    "\u05d0\u05d6\u05d5\u05e8 \u05d4\u05d7\u05d9\u05e4\u05d5\u05e9 \u05e0\u05de\u05d3\u05d3 \u05de\u05de\u05d2\u05e8\u05e9 \u05d4\u05d1\u05d9\u05ea \u05e9\u05dc \u05d4\u05e7\u05d1\u05d5\u05e6\u05d4 \u05d4\u05e0\u05d5\u05db\u05d7\u05d9\u05ea.";
+  filters.append(location, radius);
+  filters.after(hint);
+}
+
+addLocationFilters();
+
 /* ------------------------------ data loading ------------------------------ */
 
 async function getJSON(url) {
@@ -27,6 +56,7 @@ async function loadSummary() {
 
   fillSelect(el("birth-year"), summary.birth_years, (year) => `נולדו ${year}`);
   fillSelect(el("current-team"), summary.current_teams);
+  fillLocations(summary.locations || []);
 }
 
 function fillSelect(select, values, label = (value) => value) {
@@ -38,11 +68,25 @@ function fillSelect(select, values, label = (value) => value) {
   }
 }
 
+function fillLocations(locations) {
+  const select = el("location");
+  for (const location of locations) {
+    const option = document.createElement("option");
+    option.value = location.city;
+    option.textContent = location.city;
+    select.append(option);
+  }
+}
+
 async function loadResults() {
   const params = new URLSearchParams({ q: el("query").value.trim(), limit: "60" });
   if (el("above-age").checked) params.set("above_age", "1");
   if (el("birth-year").value) params.set("birth_year", el("birth-year").value);
   if (el("current-team").value) params.set("current_team", el("current-team").value);
+  if (el("location").value) {
+    params.set("location", el("location").value);
+    params.set("radius_km", el("radius-km").value);
+  }
 
   state.players = await getJSON(`/api/players?${params}`);
   renderResults();
@@ -373,6 +417,8 @@ el("query").addEventListener("input", debouncedSearch);
 el("above-age").addEventListener("change", loadResults);
 el("birth-year").addEventListener("change", loadResults);
 el("current-team").addEventListener("change", loadResults);
+el("location").addEventListener("change", loadResults);
+el("radius-km").addEventListener("change", loadResults);
 
 loadSummary().then(loadResults).catch((error) => {
   el("dataset").textContent = `שגיאה בטעינת הנתונים: ${error.message}`;
