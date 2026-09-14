@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>כניסה למערכת הסקאוטינג</title>
+<style>
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #0e1116; color: #e6edf3; font-family: "Segoe UI", Arial, sans-serif; }
+  main { width: min(360px, calc(100% - 40px)); background: #161b22; border: 1px solid #262d38; border-radius: 12px; padding: 28px; box-shadow: 0 8px 28px rgba(0,0,0,.45); }
+  h1 { margin: 0 0 8px; font-size: 22px; } p { color: #8d99a8; font-size: 14px; } label { display: grid; gap: 6px; margin-top: 16px; font-size: 14px; } input { padding: 10px 12px; color: inherit; background: #0b0e13; border: 1px solid #262d38; border-radius: 8px; font: inherit; } button { width: 100%; margin-top: 22px; padding: 10px; color: #0b0e13; background: #3fb950; border: 0; border-radius: 8px; font: inherit; font-weight: 700; cursor: pointer; } .error { margin-top: 16px; color: #ff7b72; }
+</style>
+<main>
+  <h1>מערכת סקאוטינג</h1>
+  <p>יש להיכנס עם פרטי הגישה שקיבלת.</p>
+  <form method="post" novalidate>
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    {% if next_url %}<input type="hidden" name="next" value="{{ next_url }}">{% endif %}
+    <label>שם משתמש <input name="username" autocomplete="username" required autofocus></label>
+    <label>סיסמה <input name="password" type="password" autocomplete="current-password" required></label>
+    <button type="submit">כניסה</button>
+  </form>
+  {% if error %}<p class="error">{{ error }}</p>{% endif %}
+</main>

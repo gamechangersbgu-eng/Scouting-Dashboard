@@ -68,6 +68,20 @@ html, body {
   line-height: 1.5;
 }
 
+.logout {
+  margin-top: 10px;
+  padding: 5px 9px;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.logout:hover { color: var(--text); border-color: var(--text-dim); }
+
 .controls {
   padding: 14px 20px;
   border-bottom: 1px solid var(--border);

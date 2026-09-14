@@ -11,6 +11,23 @@ const num = (value) => (value === null || value === undefined ? "—" : Number(v
 
 const state = { players: [], selected: null, map: null, layer: null, primed: false };
 
+function addLogoutButton() {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "logout";
+  button.textContent = "התנתקות";
+  button.addEventListener("click", async () => {
+    const token = await getJSON("/api/auth/csrf");
+    const response = await fetch("/logout", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ csrf_token: token.csrf_token }),
+    });
+    if (response.redirected) window.location.assign(response.url);
+  });
+  document.querySelector(".brand").append(button);
+}
+
 function addLocationFilters() {
   const filters = document.querySelector(".filters");
   const location = document.createElement("label");
@@ -39,6 +56,7 @@ function addLocationFilters() {
 }
 
 addLocationFilters();
+addLogoutButton();
 
 /* ------------------------------ data loading ------------------------------ */
 

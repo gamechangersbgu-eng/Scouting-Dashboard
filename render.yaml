@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: scouting-dashboard-private
+    runtime: python
+    plan: free
+    branch: itay/deploy-auth
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --factory --workers 1 --bind 0.0.0.0:$PORT dashboard.app:create_app
+    healthCheckPath: /login
+    autoDeployTrigger: commit
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: FLASK_SECRET_KEY
+        generateValue: true

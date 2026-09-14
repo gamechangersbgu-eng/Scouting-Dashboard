@@ -36,6 +36,40 @@ python -m ifa_scraper.venues --refresh-grounds    # re-fetch team-to-ground inst
 python -m dashboard.app --port 8000 --no-browser  # serve on another port, don't open a browser
 ```
 
+## Private web deployment
+
+The deployed dashboard requires a pre-created username and password. There is no public
+registration or password reset. Users live in PostgreSQL (Supabase is suitable), not in
+the web service filesystem.
+
+1. Keep this repository private, create a Supabase database, and set `DATABASE_URL` in
+   your shell. Use the Supabase connection pooler URL for an external host such as Render.
+2. Create the schema:
+
+   ```bash
+   python -m dashboard.manage_users migrate
+   ```
+
+3. Create a UTF-8 CSV outside the repository with the exact headers `username,password`.
+   Passwords must be at least 12 characters. Review the change first, then synchronise:
+
+   ```bash
+   python -m dashboard.manage_users sync --csv C:\safe\users.csv --dry-run
+   python -m dashboard.manage_users sync --csv C:\safe\users.csv
+   ```
+
+   The CSV is the full active roster: a user absent from a later sync is disabled. The
+   importer hashes passwords before writing and never prints them.
+
+4. In Render, create a Free Python Web Service from the `itay/deploy-auth` branch (or a
+   successor private deployment branch), with build command `pip install -r requirements.txt`
+   and start command `gunicorn --factory --workers 1 --bind 0.0.0.0:$PORT dashboard.app:create_app`.
+   Set `APP_ENV=production`, `DATABASE_URL`, and a generated `FLASK_SECRET_KEY` as Render
+   environment variables. `render.yaml` records the same settings.
+
+Render's free web services spin down after idle time and do not retain local writes, which
+is why SQLite and local user files are not used for authentication.
+
 Responses are cached under `data/cache/`, so an interrupted run resumes almost instantly.
 Delete that directory to force a refresh. Player pages are the exception: they are ~150KB
 each and only three fields are read from them, so rather than caching the HTML the

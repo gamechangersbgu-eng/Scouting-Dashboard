@@ -1,11 +1,16 @@
-"""Compatibility wrapper for dashboard filters that are not part of the core app."""
+"""Dashboard application with filters and password-protected access."""
 
+import argparse
+import logging
 import math
+import os
+import webbrowser
 from collections import defaultdict
 
 from flask import request
 
 from . import app_core as _core
+from .auth import configure_auth
 
 _original_search = _core.ScoutingData.search
 _original_summary = _core.ScoutingData.summary
@@ -153,9 +158,29 @@ def summary_with_leagues(self):
 _core.ScoutingData.search = search_with_filters
 _core.ScoutingData.summary = summary_with_leagues
 
-# Re-export the normal app factory for callers that import dashboard.app.
-create_app = _core.create_app
-main = _core.main
+def create_app(data_dir=None):
+    """Create the dashboard and require an authenticated user for every route."""
+    app = _core.create_app(data_dir)
+    app.config["APP_ENV"] = os.environ.get("APP_ENV", "development")
+    return configure_auth(app)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--port", type=int, default=5000)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--no-browser", action="store_true", help="do not open a browser")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S"
+    )
+    app = create_app()
+    url = f"http://{args.host}:{args.port}/"
+    _core.log.info("scouting dashboard on %s", url)
+    if not args.no_browser:
+        webbrowser.open(url)
+    app.run(host=args.host, port=args.port, debug=False)
 
 
 if __name__ == "__main__":
