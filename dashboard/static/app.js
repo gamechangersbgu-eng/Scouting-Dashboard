@@ -209,20 +209,6 @@ function renderHeader(player) {
   }
   badges.append(ageBadge);
 
-  // Always show the earliest registered club when the backend can identify one.
-  // This is factual registration history; it is deliberately kept separate from the
-  // inferred origin-area badge below.
-  if (player.first_club) {
-    const firstClubBadge = document.createElement("span");
-    firstClubBadge.className = "badge badge-first-club";
-    const firstSeason = player.first_registered_season
-      ? ` · ${player.first_registered_season}`
-      : "";
-    firstClubBadge.textContent = `מועדון ראשון: ${player.first_club}${firstSeason}`;
-    firstClubBadge.title = "המועדון המוקדם ביותר שנמצא בהיסטוריית הרישום הזמינה של ההתאחדות.";
-    badges.append(firstClubBadge);
-  }
-
   const originBadge = document.createElement("span");
   if (player.likely_origin_city) {
     const confidence = player.likely_origin_confidence === "medium" ? "בינוני" : "נמוך";
@@ -237,6 +223,11 @@ function renderHeader(player) {
     originBadge.className = "badge badge-origin badge-origin-ambiguous";
     originBadge.textContent = `אזור מוצא לא חד-משמעי: ${player.likely_origin_candidates.join(" / ")}`;
     originBadge.title = "בשנת הרישום הראשונה נמצאו מועדונים ביותר מעיר אחת, ולכן לא נבחרה עיר יחידה.";
+    badges.append(originBadge);
+  } else {
+    originBadge.className = "badge badge-origin badge-origin-ambiguous";
+    originBadge.textContent = "אזור מוצא משוער: לא ידוע";
+    originBadge.title = "לא נמצאה עיר אמינה עבור המועדון המוקדם ביותר ברישום הזמין. זהו אינו מידע על כתובת מגורים.";
     badges.append(originBadge);
   }
 
@@ -306,11 +297,16 @@ function renderSeasons(player) {
     league.className = "league-note";
     league.textContent = season.league_name;
     teamCell.append(league);
-    if (!season.has_stats) {
+    if (!season.stats_available) {
       const historyOnly = document.createElement("span");
       historyOnly.className = "league-note history-only";
-      historyOnly.textContent = "היסטוריה בלבד · אין סטטיסטיקה מפורטת";
+      historyOnly.textContent = "רישום היסטורי · סטטיסטיקה מספרית אינה זמינה בהתאחדות";
       teamCell.append(historyOnly);
+    } else if (season.registered_no_games) {
+      const noGames = document.createElement("span");
+      noGames.className = "league-note history-only";
+      noGames.textContent = "רשום בסגל · 0 הופעות";
+      teamCell.append(noGames);
     }
 
     const ageCell = document.createElement("td");
@@ -323,7 +319,9 @@ function renderSeasons(player) {
     }
 
     const cards = document.createElement("td");
-    const yellows = season.yellow_cards_league_cup + season.yellow_cards_toto;
+    const yellows = season.stats_available
+      ? (season.yellow_cards_league_cup ?? 0) + (season.yellow_cards_toto ?? 0)
+      : null;
     if (yellows) {
       const pill = document.createElement("span");
       pill.className = "card-pill card-yellow";

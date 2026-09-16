@@ -57,6 +57,7 @@ SEASON_COLUMNS = [
     "season",
     "team_id",
     "team_name",
+    "league_id",
     "age_group",
     "league_name",
     "games",
@@ -68,6 +69,9 @@ SEASON_COLUMNS = [
     "yellow_cards_league_cup",
     "yellow_cards_toto",
     "red_cards",
+    "stats_available",
+    "stats_source",
+    "stats_completeness",
 ]
 
 
@@ -146,11 +150,17 @@ def phase1_collect_teams(client, seasons, leagues_by_season=None):
             for team_id, team_name in teams.items():
                 entry = team_seasons.setdefault(
                     (team_id, season_id),
-                    {"team_name": team_name, "age_groups": set(), "league_names": set()},
+                    {
+                        "team_name": team_name,
+                        "age_groups": set(),
+                        "league_ids": set(),
+                        "league_names": set(),
+                    },
                 )
                 if team_name and not entry["team_name"]:
                     entry["team_name"] = team_name
                 entry["age_groups"].add(age_group)
+                entry["league_ids"].add(str(league_id))
                 entry["league_names"].add(league_name)
             if index % 25 == 0 or index == len(jobs):
                 log.info("phase 1: %s/%s league-seasons, %s team-seasons found",
@@ -180,6 +190,7 @@ def phase2_collect_squads(client, team_seasons):
                         "team_id": team_id,
                         "team_name": meta["team_name"],
                         "age_group": ", ".join(sorted(meta["age_groups"])),
+                        "league_id": ", ".join(sorted(meta["league_ids"], key=int)),
                         "league_name": ", ".join(sorted(meta["league_names"])),
                     }
                 )
@@ -194,7 +205,7 @@ def phase3_goal_splits(client, season_rows):
     """Split goals into league vs cup, only for player-seasons that produced goals."""
     goals_by_player_season = defaultdict(int)
     for row in season_rows:
-        goals_by_player_season[(row["player_id"], row["season_id"])] += row["goals"]
+        goals_by_player_season[(row["player_id"], row["season_id"])] += row["goals"] or 0
 
     jobs = sorted(key for key, goals in goals_by_player_season.items() if goals > 0)
     log.info("phase 3: %s player-seasons with goals (of %s total)",
@@ -348,7 +359,7 @@ def aggregate_players(season_rows, splits, details=None):
                 "yellow_cards_toto",
                 "red_cards",
             ):
-                totals[field] += row[field]
+                totals[field] += row[field] or 0
 
         goals_league = goals_cup = 0
         for season_id in {row["season_id"] for row in rows}:

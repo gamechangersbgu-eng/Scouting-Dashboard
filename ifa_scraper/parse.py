@@ -116,6 +116,15 @@ def _to_int(value):
         return 0
 
 
+def _optional_int(value):
+    """Parse a published number without turning an absent cell into zero."""
+    digits = re.sub(r"[^\d-]", "", value or "")
+    try:
+        return int(digits)
+    except ValueError:
+        return None
+
+
 def classify_competition(name):
     """Bucket a competition name (מסגרת) into league, cup or Toto Cup."""
     if not name:
@@ -176,7 +185,13 @@ def parse_league_fixture_teams(text):
 
 
 def parse_squad_stats(text):
-    """Return a list of per-player season stat dicts from GetTeamPlayersStatisticsList."""
+    """Return squad rows without conflating zero with an unpublished statistic.
+
+    ``GetTeamPlayersStatisticsList`` normally includes every numeric field.  A few
+    older tables are not guaranteed to do so, however.  Retaining ``None`` for an
+    absent cell lets callers distinguish a genuine zero-game registration from a
+    table which did not publish the relevant statistic at all.
+    """
     fragment = unwrap_response(text)
     if not fragment:
         return []
@@ -188,9 +203,21 @@ def parse_squad_stats(text):
             field = SQUAD_FIELDS.get(label.strip())
             if not field:
                 continue
-            row[field] = value.strip() if field == "player_name" else _to_int(value)
+            row[field] = value.strip() if field == "player_name" else _optional_int(value)
         for field in _NUMERIC_SQUAD_FIELDS:
-            row.setdefault(field, 0)
+            row.setdefault(field, None)
+        published = [row[field] for field in _NUMERIC_SQUAD_FIELDS]
+        row["stats_available"] = any(value is not None for value in published)
+        row["stats_source"] = (
+            "team_player_statistics" if row["stats_available"] else "registration_only"
+        )
+        row["stats_completeness"] = (
+            "full"
+            if all(value is not None for value in published)
+            else "partial"
+            if row["stats_available"]
+            else "unavailable"
+        )
         players.append(row)
     return players
 

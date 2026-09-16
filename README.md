@@ -21,7 +21,7 @@ Outputs land in `data/`:
 | --- | --- |
 | `players_youth.csv` | The deliverable: one row per unique `player_id` |
 | `player_season_stats.csv` | Recent per player-team-season detail, so any aggregate can be traced back |
-| `player_history.csv` | Full youth/kids player-team-season club history (identity/context only for older seasons) |
+| `player_history.csv` | Full youth/kids player-team-season history for dashboard players, with all IFA-published statistics |
 | `league_index.csv` | Discovered youth/kids leagues per historical season |
 | `player_details.csv` | Birth year, birth month and photo URL per player; also the phase 4 resume checkpoint |
 | `team_locations.csv` | One row per team with its home ground, address and coordinates |

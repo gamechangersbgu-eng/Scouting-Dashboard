@@ -71,6 +71,39 @@ def _text(value):
     return "" if cleaned is None else str(cleaned)
 
 
+def _optional_int(value):
+    """Return an integer only when the source actually published one."""
+    value = _clean(value)
+    if value is None or _text(value).strip() == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_bool(value, default=False):
+    value = _clean(value)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes"}
+
+
+def _canonical_key(row):
+    """Identity for a team aggregate published by the IFA.
+
+    The IFA statistics endpoint is already aggregated per player/team/season, even
+    where the same team appears in more than one discovered league listing.  Adding
+    a league identifier here would duplicate that aggregate, so the safe key is this
+    three-part identity rather than a display league name.
+    """
+    return (
+        _text(row.get("player_id")),
+        int(row["season_id"]),
+        _text(row.get("team_id")),
+    )
+
+
 class ScoutingData:
     """In-memory view of the scraped CSVs, indexed for per-player lookups."""
 
@@ -122,32 +155,70 @@ class ScoutingData:
     def _load_season_rows(self):
         path = self.data_dir / "player_season_stats.csv"
         frame = pd.read_csv(
-            path, encoding="utf-8-sig", dtype={"player_id": str, "team_id": str}
+            path,
+            encoding="utf-8-sig",
+            dtype={"player_id": str, "team_id": str, "league_id": str},
         )
         log.info("loaded %s player-season rows", len(frame))
-        return frame.to_dict("records")
+        return self._normalise_stat_rows(frame, source_name=path.name)
 
     def _load_history_rows(self):
-        """Load club-history rows when the historical scrape has been run.
-
-        ``player_history.csv`` intentionally contains only identity/context fields for
-        old seasons.  Recent rows are enriched with statistics later by joining them
-        to ``player_season_stats.csv`` on player, season and team id.
-        """
+        """Load historical rows, retaining their source-level availability metadata."""
         path = self.data_dir / "player_history.csv"
         if not path.exists():
             log.warning("%s missing; player pages will show detailed seasons only", path.name)
             return []
         frame = pd.read_csv(
-            path, encoding="utf-8-sig", dtype={"player_id": str, "team_id": str}
+            path,
+            encoding="utf-8-sig",
+            dtype={"player_id": str, "team_id": str, "league_id": str},
         )
+        # The full historical export intentionally records players who are no longer
+        # in the recent scouting dataset.  They cannot be opened through this
+        # dashboard, so retaining their hundreds of thousands of dictionaries in the
+        # web process serves nobody and can prevent a small deployment from booting.
+        frame = frame[frame["player_id"].isin(self.players)].copy()
+        log.info("loaded %s historical player-team-season rows", len(frame))
+        return self._normalise_stat_rows(frame, source_name=path.name)
+
+    @staticmethod
+    def _normalise_stat_rows(frame, source_name):
+        """Read both legacy and canonical CSVs without inventing missing values."""
+        frame = frame.copy()
         frame["season_id"] = pd.to_numeric(frame["season_id"], errors="coerce").astype(
             "Int64"
         )
         frame = frame[frame["season_id"].notna()].copy()
         frame["season_id"] = frame["season_id"].astype(int)
-        log.info("loaded %s historical player-team-season rows", len(frame))
-        return frame.to_dict("records")
+        for field in SEASON_STAT_FIELDS:
+            if field not in frame:
+                frame[field] = None
+            frame[field] = pd.to_numeric(frame[field], errors="coerce").astype("Int64")
+        for field in ("league_id", "stats_available", "stats_source", "stats_completeness"):
+            if field not in frame:
+                frame[field] = None
+
+        rows = []
+        for row in frame.to_dict("records"):
+            published = [_optional_int(row.get(field)) for field in SEASON_STAT_FIELDS]
+            inferred_available = any(value is not None for value in published)
+            row["stats_available"] = _as_bool(
+                row.get("stats_available"), default=inferred_available
+            )
+            row["stats_source"] = _text(row.get("stats_source")) or (
+                "team_player_statistics" if row["stats_available"] else "registration_only"
+            )
+            row["stats_completeness"] = _text(row.get("stats_completeness")) or (
+                "full"
+                if row["stats_available"] and all(value is not None for value in published)
+                else "partial"
+                if row["stats_available"]
+                else "unavailable"
+            )
+            for field, value in zip(SEASON_STAT_FIELDS, published):
+                row[field] = value
+            rows.append(row)
+        return rows
 
     def _load_locations(self):
         path = self.data_dir / "team_locations.csv"
@@ -212,32 +283,27 @@ class ScoutingData:
         return [{k: v for k, v in e.items() if k != "haystack"} for e in results[:limit]]
 
     def player(self, player_id):
-        """Full detail for one player, including club history before the stats window.
-
-        The recent bulk scrape provides official statistics.  The separate historical
-        scrape provides older player-team-season appearances.  They are unioned here;
-        historical-only rows deliberately expose ``None`` statistics so the UI renders
-        an em dash instead of incorrectly claiming zero appearances or goals.
-        """
+        """Return a player's de-duplicated career, preserving unknown statistics."""
         player = self.players.get(player_id)
         if player is None:
             return None
 
         stats_rows = self.rows_by_player.get(player_id, [])
-        stats_by_key = {
-            (int(row["season_id"]), _text(row.get("team_id"))): row
-            for row in stats_rows
-        }
-
-        # Start with historical identity rows when available, then add any detailed
-        # rows missing from an older/stale history file.
         merged = {}
-        for row in self.history_by_player.get(player_id, []):
-            key = (int(row["season_id"]), _text(row.get("team_id")))
-            merged[key] = row
-        for row in stats_rows:
-            key = (int(row["season_id"]), _text(row.get("team_id")))
-            merged.setdefault(key, row)
+        for row in [*self.history_by_player.get(player_id, []), *stats_rows]:
+            key = _canonical_key(row)
+            current = merged.get(key)
+            # The detailed recent export is considered the preferred source on a
+            # quality tie.  It is appended second, so replacing on equality prevents
+            # stale history snapshots from shadowing it.
+            if current is None or self._stat_quality(row) >= self._stat_quality(current):
+                merged[key] = row
+            elif current is not None:
+                # Retain a more descriptive context field without combining numeric
+                # values: both sources describe the same IFA aggregate.
+                for field in ("player_name", "team_name", "league_id", "league_name", "age_group"):
+                    if not _text(current.get(field)) and _text(row.get(field)):
+                        current[field] = row[field]
 
         rows = sorted(
             merged.values(),
@@ -246,33 +312,33 @@ class ScoutingData:
 
         seasons = []
         for row in rows:
-            key = (int(row["season_id"]), _text(row.get("team_id")))
-            detailed = stats_by_key.get(key)
-            source = detailed or row
-            has_stats = detailed is not None
+            has_stats = bool(row["stats_available"])
             steps = (
-                run.age_groups_above(detailed, self.details, self.natural_brackets)
-                if detailed is not None
+                run.age_groups_above(row, self.details, self.natural_brackets)
+                if has_stats
                 else None
             )
             seasons.append(
                 {
-                    "season": _text(source.get("season")),
-                    "season_id": int(source["season_id"]),
-                    "team_id": _text(source.get("team_id")),
-                    "team_name": _text(source.get("team_name")),
-                    "age_group": _text(source.get("age_group")),
-                    "league_name": _text(source.get("league_name")),
+                    "season": _text(row.get("season")),
+                    "season_id": int(row["season_id"]),
+                    "team_id": _text(row.get("team_id")),
+                    "team_name": _text(row.get("team_name")),
+                    "league_id": _text(row.get("league_id")),
+                    "league_name": _text(row.get("league_name")),
+                    "age_group": _text(row.get("age_group")),
                     "above_age_steps": steps if steps and steps > 0 else 0,
-                    "has_stats": has_stats,
-                    **{
-                        field: int(detailed.get(field) or 0) if has_stats else None
-                        for field in SEASON_STAT_FIELDS
-                    },
+                    "stats_available": has_stats,
+                    "has_stats": has_stats,  # compatibility with existing map consumers
+                    "stats_source": row["stats_source"],
+                    "stats_completeness": row["stats_completeness"],
+                    "registered_no_games": has_stats and row.get("games") == 0,
+                    **{field: row.get(field) for field in SEASON_STAT_FIELDS},
                 }
             )
 
         teams, venues = self._career_track(seasons)
+        totals = self._career_totals(seasons)
         seasons_played = []
         for entry in sorted(seasons, key=lambda e: e["season_id"], reverse=True):
             if entry["season"] and entry["season"] not in seasons_played:
@@ -293,7 +359,7 @@ class ScoutingData:
             "plays_above_age": player.get("plays_above_age") == "Yes",
             "age_groups_above": int(player.get("age_groups_above") or 0),
             "above_age_history": _text(player.get("above_age_history")),
-            "totals": {f: _clean(player.get(f)) for f in TOTAL_FIELDS},
+            "totals": totals,
             "seasons": seasons[::-1],
             "teams": teams,
             "venues": venues,
@@ -308,6 +374,43 @@ class ScoutingData:
             "likely_origin_score": origin["score"],
             "likely_origin_candidates": origin["candidates"],
             "likely_origin_basis": origin["basis"],
+        }
+
+    @staticmethod
+    def _stat_quality(row):
+        """Rank duplicate sources without ever summing the same IFA aggregate twice."""
+        completeness = _text(row.get("stats_completeness"))
+        return {
+            "full": 3,
+            "partial": 2,
+            "unavailable": 1,
+        }.get(completeness, 2 if row.get("stats_available") else 1)
+
+    @staticmethod
+    def _career_totals(seasons):
+        """Sum only published values across the complete deduplicated timeline."""
+        totals = {field: 0 for field in SEASON_STAT_FIELDS}
+        for season in seasons:
+            if not season["stats_available"]:
+                continue
+            for field in SEASON_STAT_FIELDS:
+                value = season.get(field)
+                if value is not None:
+                    totals[field] += value
+        games = totals["games"]
+        return {
+            "goals_total": totals["goals"],
+            # Historical team aggregates cannot be split reliably by competition.
+            "goals_league": None,
+            "goals_cup": None,
+            "games_total": games,
+            "minutes_total": totals["minutes"],
+            "avg_minutes_per_game": round(totals["minutes"] / games, 1) if games else None,
+            "starts": totals["starts"],
+            "sub_on": totals["sub_on"],
+            "sub_off": totals["sub_off"],
+            "yellow_cards_total": totals["yellow_cards_league_cup"] + totals["yellow_cards_toto"],
+            "red_cards": totals["red_cards"],
         }
 
     @staticmethod
