@@ -32,11 +32,18 @@ LOCATION_COLUMNS = [
     "field_name",
     "address",
     "city",
+    "district",
     "lat",
     "lon",
     "geocode_query",
     "precision",
 ]
+
+# The association files every ground under one of four districts of its own, published
+# as a numeric class on each entry in the grounds directory. That beats inferring a
+# region from coordinates, where the bands overlap: Sharon and central grounds interleave
+# by latitude, and Jerusalem sits at the same latitude as Ashdod.
+FIELD_DISTRICTS = {"1": "צפון", "2": "שרון", "3": "מרכז", "4": "דרום"}
 
 # How a team's coordinates were arrived at, best first.
 PRECISION_STREET = "street"
@@ -109,14 +116,27 @@ def word_groups(text, from_start=False, max_words=MAX_PLACE_WORDS):
     return groups
 
 
-def teams_to_locate(stats_path):
-    """Every team in the scraped stats, with the newest season it appears in.
+def teams_to_locate(*paths):
+    """Every team across the given season files, with the newest season it appears in.
 
-    The team page is season-scoped, so each team is fetched for a season it actually
-    played in.
+    Both the stats and the club-history files are read, since the older seasons include
+    clubs that have since folded but still belong on a player's map. The team page is
+    season-scoped, so each team is fetched for a season it actually played in.
     """
-    stats = pd.read_csv(stats_path, encoding="utf-8-sig", dtype={"team_id": str})
-    latest = stats.groupby(["team_id", "team_name"], as_index=False)["season_id"].max()
+    frames = [
+        pd.read_csv(path, encoding="utf-8-sig", dtype={"team_id": str})[
+            ["team_id", "team_name", "season_id"]
+        ]
+        for path in paths
+        if path.exists()
+    ]
+    if not frames:
+        return []
+    # Grouped by id alone, not by (id, name): clubs get renamed and respelled between
+    # seasons, so grouping on the name too would locate the same club several times.
+    # Sorting first means each club keeps the name from its most recent season.
+    seasons = pd.concat(frames, ignore_index=True).sort_values("season_id")
+    latest = seasons.groupby("team_id", as_index=False).last()
     return [
         (row.team_id, row.team_name, int(row.season_id))
         for row in latest.itertuples(index=False)
@@ -258,7 +278,10 @@ def main():
     started = time.time()
 
     client = IFAClient()
-    teams = teams_to_locate(config.DATA_DIR / "player_season_stats.csv")
+    teams = teams_to_locate(
+        config.DATA_DIR / "player_season_stats.csv",
+        config.DATA_DIR / "player_history.csv",
+    )
     log.info("%s teams to locate", len(teams))
 
     checkpoint = config.DATA_DIR / "team_fields.csv"
@@ -285,6 +308,7 @@ def main():
                 "field_name": mapping.get("field_name", ""),
                 "address": field.get("address", ""),
                 "city": (located or {}).get("city") or place_hint(team_name),
+                "district": FIELD_DISTRICTS.get(field.get("region"), ""),
                 "lat": located["lat"] if located else "",
                 "lon": located["lon"] if located else "",
                 "geocode_query": located["query"] if located else "",

@@ -50,9 +50,12 @@ async function getJSON(url) {
 
 async function loadSummary() {
   const summary = await getJSON("/api/summary");
+  const historyText = summary.history_seasons?.length
+    ? ` · היסטוריה ${summary.history_seasons.at(-1)}–${summary.history_seasons[0]}`
+    : "";
   el("dataset").textContent =
     `${num(summary.players)} שחקנים · ${num(summary.teams_located)}/${num(summary.teams)} קבוצות מאותרות · ` +
-    `${num(summary.above_age)} משחקים מעל הגיל · עונות ${summary.seasons.join(", ")}`;
+    `${num(summary.above_age)} משחקים מעל הגיל · סטטיסטיקה ${summary.seasons.join(", ")}${historyText}`;
 
   fillSelect(el("birth-year"), summary.birth_years, (year) => `נולדו ${year}`);
   fillSelect(el("current-team"), summary.current_teams);
@@ -188,6 +191,37 @@ function renderHeader(player) {
   }
   badges.append(ageBadge);
 
+  // Always show the earliest registered club when the backend can identify one.
+  // This is factual registration history; it is deliberately kept separate from the
+  // inferred origin-area badge below.
+  if (player.first_club) {
+    const firstClubBadge = document.createElement("span");
+    firstClubBadge.className = "badge badge-first-club";
+    const firstSeason = player.first_registered_season
+      ? ` · ${player.first_registered_season}`
+      : "";
+    firstClubBadge.textContent = `מועדון ראשון: ${player.first_club}${firstSeason}`;
+    firstClubBadge.title = "המועדון המוקדם ביותר שנמצא בהיסטוריית הרישום הזמינה של ההתאחדות.";
+    badges.append(firstClubBadge);
+  }
+
+  const originBadge = document.createElement("span");
+  if (player.likely_origin_city) {
+    const confidence = player.likely_origin_confidence === "medium" ? "בינוני" : "נמוך";
+    originBadge.className = "badge badge-origin";
+    originBadge.textContent = `אזור מוצא משוער: ${player.likely_origin_city} · ביטחון ${confidence}`;
+    const basis = player.likely_origin_basis || {};
+    const clubs = Array.isArray(basis.clubs) ? basis.clubs.join(" / ") : "";
+    const age = Number.isInteger(basis.approx_age) ? `, גיל משוער ${basis.approx_age}` : "";
+    originBadge.title = `הערכה לפי המועדון הראשון הרשום${clubs ? `: ${clubs}` : ""}${basis.season ? ` (${basis.season}${age})` : ""}. אינה כתובת מגורים מאומתת.`;
+    badges.append(originBadge);
+  } else if (player.likely_origin_confidence === "ambiguous" && player.likely_origin_candidates?.length) {
+    originBadge.className = "badge badge-origin badge-origin-ambiguous";
+    originBadge.textContent = `אזור מוצא לא חד-משמעי: ${player.likely_origin_candidates.join(" / ")}`;
+    originBadge.title = "בשנת הרישום הראשונה נמצאו מועדונים ביותר מעיר אחת, ולכן לא נבחרה עיר יחידה.";
+    badges.append(originBadge);
+  }
+
   for (const group of player.age_groups.split(", ").filter(Boolean)) {
     const badge = document.createElement("span");
     badge.className = "badge";
@@ -254,6 +288,12 @@ function renderSeasons(player) {
     league.className = "league-note";
     league.textContent = season.league_name;
     teamCell.append(league);
+    if (!season.has_stats) {
+      const historyOnly = document.createElement("span");
+      historyOnly.className = "league-note history-only";
+      historyOnly.textContent = "היסטוריה בלבד · אין סטטיסטיקה מפורטת";
+      teamCell.append(historyOnly);
+    }
 
     const ageCell = document.createElement("td");
     ageCell.append(document.createTextNode(season.age_group));
@@ -329,8 +369,15 @@ function popupHTML(venue, total) {
   const lines = [
     `<b>${escapeHTML(venue.teams.join(" · "))}</b>`,
     `<span class="popup-meta">מקום ${venue.order + 1} מתוך ${total} · ${escapeHTML(venue.seasons)}</span>`,
-    `<span class="popup-meta">${venue.games} מש׳ · ${venue.goals} שערים · ${venue.minutes} דק׳</span>`,
   ];
+  if (venue.has_detailed_stats) {
+    const suffix = venue.stats_complete ? "" : " · לעונות המכוסות בלבד";
+    lines.push(
+      `<span class="popup-meta">${venue.games} מש׳ · ${venue.goals} שערים · ${venue.minutes} דק׳${suffix}</span>`
+    );
+  } else {
+    lines.push('<span class="popup-meta">היסטוריית מועדון · ללא סטטיסטיקה מפורטת</span>');
+  }
   const where = [venue.field_name, venue.city].filter(Boolean).map(escapeHTML).join(" · ");
   if (where) lines.push(`<span class="popup-meta">מגרש: ${where}</span>`);
   if (venue.above_age_steps > 0) {

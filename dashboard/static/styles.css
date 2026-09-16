@@ -491,3 +491,22 @@ table.seasons tbody tr:hover { background: #1b2230; }
   font-weight: 700;
   color: var(--warn);
 }
+
+/* Historical club rows intentionally have no detailed match statistics. */
+.history-only {
+  color: var(--warn);
+  opacity: 0.85;
+}
+
+/* Earliest factual club registration found in the available IFA history. */
+.badge-first-club {
+  border-color: rgba(88, 166, 255, 0.45);
+}
+
+/* Estimated origin area derived from the player's earliest registered club. */
+.badge-origin {
+  border-style: dashed;
+}
+.badge-origin-ambiguous {
+  opacity: 0.85;
+}

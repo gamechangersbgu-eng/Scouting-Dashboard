@@ -1,3 +1,11 @@
-"""Local scouting dashboard for the scraped IFA youth-league data."""
+"""Scraper for Israeli Football Association youth league player statistics."""
 
-__all__ = ["app"]
+__all__ = [
+    "client",
+    "config",
+    "history",
+    "leagues",
+    "parse",
+    "run",
+    "venues",
+]

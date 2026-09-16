@@ -1,27 +1,43 @@
-# Historical seasons
+# Historical club seasons
 
-The scraper runs with the **current season only** by default (`2026/27`).
+The project separates **recent detailed statistics** from **full club history**.
 
-To scrape earlier seasons, pass their season IDs explicitly. The historical range currently supported by the configuration goes back to **2022/23**.
+- `python -m ifa_scraper.run` scrapes the three detailed-stat seasons: 2024/25,
+  2025/26 and 2026/27.
+- `python -m ifa_scraper.history` scrapes player-to-club appearances across the full
+  configured youth/kids history window, currently 2010/11 through 2026/27.
+
+The historical pass intentionally stores only identity/context fields (player, team,
+season, age bracket and league). It does **not** pretend that old games/goals/minutes are
+available when they were not collected. The dashboard joins the overlapping recent
+history rows to `player_season_stats.csv`, so recent seasons retain their detailed stats
+while older rows display `—` for unavailable statistics.
+
+## Recommended workflow
 
 ```bash
-# 2025/26
-python -m ifa_scraper.run --seasons 27
+# 1. Detailed current/recent statistics
+python -m ifa_scraper.run
 
-# 2024/25
-python -m ifa_scraper.run --seasons 26
+# 2. Full youth/kids club history
+python -m ifa_scraper.history
 
-# 2023/24
-python -m ifa_scraper.run --seasons 25
+# 3. Resolve home grounds for current and historical teams
+python -m ifa_scraper.venues
 
-# 2022/23
-python -m ifa_scraper.run --seasons 24
-
-# All seasons from 2022/23 through the current season
-python -m ifa_scraper.run --seasons 28 27 26 25 24
+# 4. Reload the dashboard
+python -m dashboard.app
 ```
 
-Season IDs:
+The history scraper discovers the actual youth/kids league index separately for each
+season. This matters because old seasons contain divisions that are no longer present in
+the site's current navigation.
+
+Discovery is checkpointed in `data/league_index.csv`, and HTTP responses from the table
+endpoints are cached under `data/cache/`, so subsequent runs do not repeat the expensive
+league-id scan.
+
+## Configured history seasons
 
 | Season | ID |
 |---|---:|
@@ -30,11 +46,24 @@ Season IDs:
 | 2024/25 | 26 |
 | 2023/24 | 25 |
 | 2022/23 | 24 |
+| 2021/22 | 23 |
+| 2020/21 | 22 |
+| 2019/20 | 21 |
+| 2018/19 | 20 |
+| 2017/18 | 19 |
+| 2016/17 | 18 |
+| 2015/16 | 17 |
+| 2014/15 | 16 |
+| 2013/14 | 15 |
+| 2012/13 | 14 |
+| 2011/12 | 13 |
+| 2010/11 | 12 |
 
-After scraping, restart the dashboard so it reloads the CSV files:
+The window begins at 2010/11 because the current player dataset includes a small number
+of players born in 2005; this reaches approximately age five for that oldest cohort.
+
+You can restrict the history run when debugging, for example:
 
 ```bash
-python -m dashboard.app
+python -m ifa_scraper.history --seasons 28 27 26 25 24
 ```
-
-The default configuration is in `ifa_scraper/config.py` under `SEASONS`.

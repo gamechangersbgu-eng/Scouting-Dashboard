@@ -10,7 +10,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from decimal import ROUND_HALF_UP, Decimal
 
-from . import config, parse
+from . import config, leagues, parse
 from .client import IFAClient
 
 log = logging.getLogger("ifa_scraper")
@@ -120,20 +120,27 @@ def round_half_up(value, places=1):
     return float(Decimal(str(value)).quantize(quantum, rounding=ROUND_HALF_UP))
 
 
-def phase1_collect_teams(client, seasons):
-    """Map every (team_id, season_id) in the youth leagues to its name and league."""
-    leagues = config.league_index()
-    jobs = [(lid, sid) for sid in seasons for lid in leagues]
+def phase1_collect_teams(client, seasons, leagues_by_season=None):
+    """Map every (team_id, season_id) in the youth leagues to its name and league.
+
+    leagues_by_season lets a caller pass the league index discovered for each season,
+    which is not the same set every year; without it the configured table is used for
+    every season.
+    """
+    fallback = config.league_index()
+    leagues_by_season = leagues_by_season or {}
+    season_leagues = {sid: leagues_by_season.get(sid) or fallback for sid in seasons}
+    jobs = [(lid, sid) for sid in seasons for lid in season_leagues[sid]]
     team_seasons = {}
     empty_leagues = []
 
     def fetch(job):
         league_id, season_id = job
-        return job, parse.parse_league_teams(client.league_tables(league_id, season_id))
+        return job, leagues.league_teams(client, league_id, season_id)
 
     with ThreadPoolExecutor(config.MAX_WORKERS) as pool:
         for index, ((league_id, season_id), teams) in enumerate(pool.map(fetch, jobs), 1):
-            age_group, league_name = leagues[league_id]
+            age_group, league_name = season_leagues[season_id][league_id]
             if not teams:
                 empty_leagues.append((league_id, league_name, season_id))
             for team_id, team_name in teams.items():
@@ -169,7 +176,7 @@ def phase2_collect_squads(client, team_seasons):
                     {
                         **player,
                         "season_id": season_id,
-                        "season": config.SEASONS[season_id],
+                        "season": config.season_label(season_id),
                         "team_id": team_id,
                         "team_name": meta["team_name"],
                         "age_group": ", ".join(sorted(meta["age_groups"])),
@@ -457,6 +464,11 @@ def main():
         action="store_true",
         help="skip phase 4; leaves birth_year and image_url empty",
     )
+    parser.add_argument(
+        "--leagues-from-config",
+        action="store_true",
+        help="use the configured league table instead of discovering each season's",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -473,7 +485,12 @@ def main():
         client = IFAClient(use_cache=not args.no_cache)
 
         log.info("scraping seasons: %s", ", ".join(config.SEASONS[s] for s in seasons))
-        team_seasons, empty_leagues = phase1_collect_teams(client, seasons)
+        league_index = (
+            None
+            if args.leagues_from_config
+            else leagues.youth_index(client, seasons)
+        )
+        team_seasons, empty_leagues = phase1_collect_teams(client, seasons, league_index)
         season_rows = phase2_collect_squads(client, team_seasons)
         splits = {} if args.skip_goal_split else phase3_goal_splits(client, season_rows)
 

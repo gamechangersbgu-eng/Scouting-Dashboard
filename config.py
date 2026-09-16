@@ -34,8 +34,10 @@ SEASONS = {
 }
 
 # Seasons scraped for club history only (no goals or minutes). Goes back through the
-# kids brackets: a 2008-born still in נוער today was in טרום around 2014/15, and the
-# association's kids tables are populated that far. Current seasons are included too,
+# kids brackets.  The current dataset contains a small number of players born as
+# early as 2005, so the history window reaches 2010/11 (roughly age five) rather than
+# assuming everybody followed the normal current-year age ladder. Current seasons are
+# included too,
 # because many players in נערים still turned out for a ילדים side in 2024/25.
 HISTORY_SEASONS = {
     25: "2023/24",
@@ -48,6 +50,10 @@ HISTORY_SEASONS = {
     18: "2016/17",
     17: "2015/16",
     16: "2014/15",
+    15: "2013/14",
+    14: "2012/13",
+    13: "2011/12",
+    12: "2010/11",
 }
 
 

@@ -20,6 +20,13 @@ _TEAM_NAME_RE = re.compile(
     r"<span class='sr-only'>קבוצה</span>([^<]*)</div>",
     re.S,
 )
+# Kids leagues often render fixtures as <div class="table_row"> rather than a
+# link, so the row body runs until the next fixture (or the end of the table).
+_FIXTURE_ROW_RE = re.compile(
+    r"data-team1=['\"](\d+)['\"]\s+data-team2=['\"](\d+)['\"](.*?)(?=data-team1=|$)",
+    re.S,
+)
+_FIXTURE_NAME_RE = re.compile(r'class="team-name-text">(.*?)</span>', re.S)
 _SQUAD_ROW_RE = re.compile(
     r"<a class='table_row link_url'[^>]*?player_id=(\d+)[^>]*>(.*?)</a>", re.S
 )
@@ -120,6 +127,11 @@ def classify_competition(name):
     return LEAGUE
 
 
+def _keep_team(team_id, name):
+    """Drop bye rows: the association lists a free week as team id 0 / חופשית."""
+    return bool(team_id) and team_id != "0" and name != "חופשית"
+
+
 def parse_league_teams(text):
     """Return {team_id: team_name} from a League_AllTables response."""
     fragment = unwrap_response(text)
@@ -129,9 +141,37 @@ def parse_league_teams(text):
     for team_id, body in _TEAM_ROW_RE.findall(fragment):
         name_match = _TEAM_NAME_RE.search(body)
         name = name_match.group(1).strip() if name_match else ""
+        if not _keep_team(team_id, name):
+            continue
         # Keep the first non-empty name seen for a given team.
         if team_id not in teams or (name and not teams[team_id]):
             teams[team_id] = name
+    return teams
+
+
+def parse_league_fixture_teams(text):
+    """Return {team_id: team_name} from the fixture list in a League_AllTables response.
+
+    Some league-seasons are run without a standings table, and the same response then
+    carries the round's fixtures instead. Each fixture row names both sides and carries
+    their ids, which is the only place those teams can be found. Kids tables in
+    particular render those rows as divs, not as links to the match page.
+    """
+    fragment = html.unescape(unwrap_response(text))
+    teams = {}
+    for home_id, away_id, body in _FIXTURE_ROW_RE.findall(fragment):
+        names = [
+            # The home side is rendered as "name&nbsp;- ", so the separator comes off.
+            re.sub(r"\s+", " ", html.unescape(name).replace("\xa0", " ")).strip(" -")
+            for name in _FIXTURE_NAME_RE.findall(body)
+        ]
+        if len(names) != 2:
+            continue
+        for team_id, name in zip((home_id, away_id), names):
+            if not _keep_team(team_id, name):
+                continue
+            if team_id not in teams or (name and not teams[team_id]):
+                teams[team_id] = name
     return teams
 
 

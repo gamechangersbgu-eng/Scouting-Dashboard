@@ -189,6 +189,13 @@ class IFAClient:
         # by the caller rather than cached as raw HTML.
         return self.get(f"/players/player/?player_id={player_id}", cache=False)
 
+    def league_page(self, league_id, season_id):
+        # ~250KB per page and only the heading is needed, so the name is checkpointed
+        # by the caller rather than cached as raw HTML.
+        return self.get(
+            f"/leagues/league/?league_id={league_id}&season_id={season_id}", cache=False
+        )
+
     def team_page(self, team_id, season_id):
         # ~190KB per page, of which only the grounds block is used; checkpointed instead.
         return self.get(

@@ -9,8 +9,9 @@ the result.
 
 ```bash
 pip install -r requirements.txt
-python -m ifa_scraper.run       # scrape players (slow, resumable)
-python -m ifa_scraper.venues    # locate every team on the map
+python -m ifa_scraper.run       # recent detailed stats (slow, resumable)
+python -m ifa_scraper.history   # full youth/kids club history
+python -m ifa_scraper.venues    # locate current + historical teams on the map
 python -m dashboard.app         # open the dashboard
 ```
 
@@ -19,7 +20,9 @@ Outputs land in `data/`:
 | File | Contents |
 | --- | --- |
 | `players_youth.csv` | The deliverable: one row per unique `player_id` |
-| `player_season_stats.csv` | Per player-team-season detail, so any aggregate can be traced back |
+| `player_season_stats.csv` | Recent per player-team-season detail, so any aggregate can be traced back |
+| `player_history.csv` | Full youth/kids player-team-season club history (identity/context only for older seasons) |
+| `league_index.csv` | Discovered youth/kids leagues per historical season |
 | `player_details.csv` | Birth year, birth month and photo URL per player; also the phase 4 resume checkpoint |
 | `team_locations.csv` | One row per team with its home ground, address and coordinates |
 | `team_fields.csv` | Team-to-ground mapping; the resume checkpoint for `venues` |
@@ -47,9 +50,12 @@ and is cleared automatically on exit (including after a crash, via a stale-PID c
 
 ## Coverage
 
-42 youth leagues (11 נוער, 9 נערים א, 11 נערים ב, 11 נערים ג) across three seasons:
-2024/25, 2025/26 and 2026/27. Note that 2026/27 had only just started at the time of
-scraping, so it contributes current team affiliations more than accumulated statistics.
+Detailed statistics cover 42 configured youth leagues (11 נוער, 9 נערים א,
+11 נערים ב, 11 נערים ג) across 2024/25, 2025/26 and 2026/27. The separate history
+scrape discovers the actual youth/kids divisions season-by-season and extends club
+tracking through ילדים and טרום-ילדים back to 2010/11. Older history rows intentionally
+carry club context only; unavailable historical game statistics are shown as missing,
+not as zero.
 
 ## Data source
 
@@ -106,8 +112,18 @@ CSVs are written as `utf-8-sig` so the Hebrew columns open correctly in Excel.
 ## The scouting dashboard
 
 `python -m dashboard.app` serves a single page on `http://127.0.0.1:5000/`. Pick a player
-and it shows their career totals, whether they are playing above their age group, a
-season-by-season table, and a map of every place they have played.
+and it shows their recent career totals, whether they are playing above their age group,
+a full club-history table, and a map of every located place they have played. Detailed
+recent rows show games/goals/minutes; history-only rows show `—` for unavailable stats.
+
+The player header also shows a **likely origin area** derived from the locality of the
+first registered club in the complete history. This is intentionally presented as an
+estimate rather than a hometown fact: a youth player may commute from another locality.
+The API therefore returns `likely_origin_city`, a conservative `medium`/`low` confidence,
+the first registered season, and the evidence used. If the earliest season contains
+clubs in different cities, the result is marked ambiguous instead of choosing one.
+Run `python -m ifa_scraper.venues` after `python -m ifa_scraper.history` so historical
+clubs have locality data before using this feature.
 
 On the map, **the earlier the club, the bigger the marker**, and a dashed line joins the
 places in career order. Markers are numbered from earliest to most recent; amber marks a
