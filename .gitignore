@@ -1,8 +1,10 @@
 .env
 .env.*
 !/.env.example
+.venv/
 users.csv
 *.sqlite3
 __pycache__/
 *.py[cod]
 .pytest_cache/
+*.pyc
