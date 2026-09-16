@@ -26,7 +26,7 @@ RETRY_BACKOFF = 1.5
 POLITENESS_DELAY = 0.15
 
 # Default scrape: current season only. Historical seasons can be requested explicitly
-# with: python -m ifa_scraper.run --seasons 27 26
+# with: python -m ifa_scraper.run --seasons 27 26 25 24
 SEASONS = {
     28: "2026/27",
 }
