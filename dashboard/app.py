@@ -12,8 +12,8 @@ from flask import request
 from . import app_core as _core
 from .auth import configure_auth
 
-_original_search = _core.ScoutingData.search
-_original_summary = _core.ScoutingData.summary
+_original_search = _core.BaseScoutingData.search
+_original_summary = _core.BaseScoutingData.summary
 
 
 def _coordinates(row):
@@ -155,12 +155,15 @@ def summary_with_leagues(self):
     return summary
 
 
-_core.ScoutingData.search = search_with_filters
-_core.ScoutingData.summary = summary_with_leagues
+# Patched on the shared base class (not on CsvScoutingData) so the league/
+# location search filters also apply to PostgresScoutingData once it exists --
+# the two are siblings under BaseScoutingData, not one a subclass of the other.
+_core.BaseScoutingData.search = search_with_filters
+_core.BaseScoutingData.summary = summary_with_leagues
 
-def create_app(data_dir=None):
+def create_app(data_dir=None, data_source=None):
     """Create the dashboard and require an authenticated user for every route."""
-    app = _core.create_app(data_dir)
+    app = _core.create_app(data_dir, data_source=data_source)
     app.config["APP_ENV"] = os.environ.get("APP_ENV", "development")
     return configure_auth(app)
 

@@ -10,7 +10,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from decimal import ROUND_HALF_UP, Decimal
 
-from . import config, leagues, parse
+from . import config, leagues, name_quality, parse
 from .client import IFAClient
 
 log = logging.getLogger("ifa_scraper")
@@ -22,6 +22,7 @@ YOUTH_MARKERS = ("נוער", "נערים")
 PLAYER_COLUMNS = [
     "player_id",
     "player_name",
+    "name_status",
     "birth_year",
     "current_team",
     "teams_history",
@@ -152,16 +153,24 @@ def phase1_collect_teams(client, seasons, leagues_by_season=None):
                     (team_id, season_id),
                     {
                         "team_name": team_name,
-                        "age_groups": set(),
-                        "league_ids": set(),
-                        "league_names": set(),
+                        # A team-season can be discovered under more than one
+                        # league listing (see the "leagues" field below), so
+                        # this stays keyed by league_id rather than being a
+                        # second, independently-built set: keeping age_group
+                        # and league_name attached to the league_id they were
+                        # actually observed with is what lets phase2 emit them
+                        # in matching order, instead of two comma-joined
+                        # strings sorted independently that can silently
+                        # drift out of alignment with each other.
+                        "leagues": {},
                     },
                 )
                 if team_name and not entry["team_name"]:
                     entry["team_name"] = team_name
-                entry["age_groups"].add(age_group)
-                entry["league_ids"].add(str(league_id))
-                entry["league_names"].add(league_name)
+                entry["leagues"][str(league_id)] = {
+                    "league_name": league_name,
+                    "age_group": age_group,
+                }
             if index % 25 == 0 or index == len(jobs):
                 log.info("phase 1: %s/%s league-seasons, %s team-seasons found",
                          index, len(jobs), len(team_seasons))
@@ -181,6 +190,21 @@ def phase2_collect_squads(client, team_seasons):
     with ThreadPoolExecutor(config.MAX_WORKERS) as pool:
         for index, ((team_id, season_id), squad) in enumerate(pool.map(fetch, jobs), 1):
             meta = team_seasons[(team_id, season_id)]
+            # Iterate the leagues this team-season was actually discovered under
+            # in one consistent order (numeric league_id) and build all three
+            # display strings from that single ordering, so position i of
+            # league_id always names the same league as position i of
+            # league_name/age_group -- building them as separately-sorted sets
+            # (the previous approach) can put unrelated leagues' id and name at
+            # the same position once a team-season spans more than one league.
+            ordered_league_ids = sorted(meta["leagues"], key=int)
+            age_group = ", ".join(
+                dict.fromkeys(meta["leagues"][lid]["age_group"] for lid in ordered_league_ids)
+            )
+            league_id = ", ".join(ordered_league_ids)
+            league_name = ", ".join(
+                dict.fromkeys(meta["leagues"][lid]["league_name"] for lid in ordered_league_ids)
+            )
             for player in squad:
                 rows.append(
                     {
@@ -189,9 +213,9 @@ def phase2_collect_squads(client, team_seasons):
                         "season": config.season_label(season_id),
                         "team_id": team_id,
                         "team_name": meta["team_name"],
-                        "age_group": ", ".join(sorted(meta["age_groups"])),
-                        "league_id": ", ".join(sorted(meta["league_ids"], key=int)),
-                        "league_name": ", ".join(sorted(meta["league_names"])),
+                        "age_group": age_group,
+                        "league_id": league_id,
+                        "league_name": league_name,
                     }
                 )
             if index % 100 == 0 or index == len(jobs):
@@ -409,10 +433,18 @@ def aggregate_players(season_rows, splits, details=None):
 
         games = totals["games"]
         detail = (details or {}).get(player_id) or {}
+        # rows[0] is the newest appearance, but IFA masks some players' names as a
+        # run of asterisks on some pages while publishing the real name elsewhere
+        # for the same player. Using rows[0]'s name unconditionally can silently
+        # replace a known name with a masked one on the very next scrape, so every
+        # observed name is ranked instead (known > masked > missing; newest wins
+        # ties, since ``rows`` is already sorted newest-first).
+        name_status, player_name = name_quality.best_name(row["player_name"] for row in rows)
         players.append(
             {
                 "player_id": player_id,
-                "player_name": rows[0]["player_name"],
+                "player_name": player_name,
+                "name_status": name_status,
                 "birth_year": detail.get("birth_year") or "",
                 "image_url": detail.get("image_url") or "",
                 "current_team": teams_seen[0] if teams_seen else "",

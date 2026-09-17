@@ -1,8 +1,18 @@
 """Local scouting dashboard over the scraped youth-league data.
 
-Serves a single page plus a small JSON API. Everything is read from the CSVs in data/
-once at startup and held in memory, so the dashboard needs no network access and no
-database. Run it with:
+Serves a single page plus a small JSON API. Everything is loaded into memory once at
+startup and held there, so a request never touches a CSV file or a database.
+
+Two data sources exist behind one shared in-memory model (``BaseScoutingData``):
+
+* ``CsvScoutingData`` reads the CSVs in data/ -- the default, and still what Render
+  runs. No network access and no database.
+* ``PostgresScoutingData`` (dashboard/postgres_source.py) reads the same shape of
+  data from a Postgres database's currently-published dataset instead. It is loaded
+  lazily, only when ``DATA_SOURCE=postgres``, so psycopg does not need to be
+  installed for the default CSV path to work.
+
+Run the CSV-backed app with:
 
     python -m dashboard.app
 """
@@ -10,13 +20,14 @@ database. Run it with:
 import argparse
 import logging
 import math
+import os
 import webbrowser
 from collections import defaultdict
 
 import pandas as pd
 from flask import Flask, jsonify, request, send_from_directory
 
-from ifa_scraper import config, run
+from ifa_scraper import config, name_quality, run
 
 log = logging.getLogger(__name__)
 
@@ -104,11 +115,101 @@ def _canonical_key(row):
     )
 
 
-class ScoutingData:
-    """In-memory view of the scraped CSVs, indexed for per-player lookups."""
+def _stat_quality(row):
+    """Rank duplicate sources without ever summing the same IFA aggregate twice."""
+    completeness = _text(row.get("stats_completeness"))
+    return {
+        "full": 3,
+        "partial": 2,
+        "unavailable": 1,
+    }.get(completeness, 2 if row.get("stats_available") else 1)
 
-    def __init__(self, data_dir=None):
-        self.data_dir = data_dir or config.DATA_DIR
+
+def merge_canonical_rows(rows):
+    """Collapse rows sharing a canonical key into one winner per key.
+
+    Used both by ``BaseScoutingData.player()`` (CSV: merging
+    ``player_season_stats.csv`` against ``player_history.csv`` at read time)
+    and by ``scripts.import_canonical_dataset`` (Postgres: merging the same
+    two sources once, at import time, into a single canonical
+    ``player_team_seasons`` row per (player_id, team_id, season_id) --
+    ``source_file`` is provenance, never part of the row's identity, so at
+    most one row may exist per canonical key). Both call sites must produce
+    identical results for the same input rows, which is why this lives in one
+    place instead of two: a second copy of this algorithm is a parity risk
+    the moment one of them drifts.
+
+    Returns ``{canonical_key: merged_row}``. When two rows share a key, the
+    later one in ``rows`` wins ties on stats quality (callers pass the row
+    they want preferred on a tie last -- CSV passes history rows first, then
+    the more detailed recent-export rows second; the importer's row order
+    follows the same convention, see ``_load_season_source``).
+    """
+    merged = {}
+    for row in rows:
+        key = _canonical_key(row)
+        current = merged.get(key)
+        if current is None:
+            merged[key] = dict(row)
+            continue
+        if _stat_quality(row) >= _stat_quality(current):
+            winner, loser = dict(row), current
+        else:
+            winner, loser = current, row
+        # The winner on numeric-stats quality is not necessarily the winner on
+        # name evidence: IFA masks some players' names (a run of asterisks) on
+        # some pages while publishing the real name elsewhere for the same
+        # player, and a masked name must never displace a known one just
+        # because its row happened to carry more complete statistics.
+        winner["player_name"] = name_quality.better_name(
+            winner.get("player_name"), loser.get("player_name")
+        )
+        # Retain other descriptive context without combining numeric values:
+        # both sources describe the same IFA aggregate. ``league_id`` here is
+        # the CSV/scraper's own display text for that row (see the module
+        # docstring on why it can be a comma-joined, multi-valued string) --
+        # unrelated to any database identity key.
+        for field in ("team_name", "league_id", "league_name", "age_group"):
+            if not _text(winner.get(field)) and _text(loser.get(field)):
+                winner[field] = loser[field]
+        merged[key] = winner
+    return merged
+
+
+class BaseScoutingData:
+    """In-memory canonical view, indexed for per-player lookups.
+
+    This class holds every method that only cares about *already-loaded* Python
+    data structures (search, the player-detail merge, origin inference, career
+    totals, the map/venue grouping). It knows nothing about CSVs or Postgres.
+
+    A concrete subclass supplies the five ``_load_*`` methods, each returning
+    the same shape regardless of where the data came from:
+
+    * ``_load_players()``       -> {player_id: row} from the player catalog
+      (``players_youth.csv`` or the ``players`` table for the current dataset)
+    * ``_load_season_rows()``   -> list of recent, detailed player-team-season
+      rows (``player_season_stats.csv`` / ``source_file='player_season_stats'``)
+    * ``_load_history_rows()``  -> list of broader historical player-team-season
+      rows, possibly overlapping the above (``player_history.csv`` /
+      ``source_file='player_history'``)
+    * ``_load_locations()``     -> {team_id: row} of the team's current venue
+    * ``_load_details()``       -> {player_id: {"birth_year": ...}}
+
+    ``season_rows`` and ``history_rows`` are two views of the *same* underlying
+    grain -- one row per (player_id, team_id, season_id) -- kept separate
+    because they can each publish a row for the same key with different
+    completeness (see ``_canonical_key`` and ``player()`` below); the merge
+    that picks a winner between them happens once, per player, on read.
+    """
+
+    def __init__(self):
+        """Run the shared loading sequence.
+
+        A subclass sets whatever source-specific attribute it needs (``data_dir``
+        for CSVs, ``database_url`` for Postgres) *before* calling
+        ``super().__init__()``, since the ``_load_*`` methods below read it.
+        """
         self.players = self._load_players()
         self.season_rows = self._load_season_rows()
         self.history_rows = self._load_history_rows()
@@ -144,42 +245,19 @@ class ScoutingData:
         ]
 
     def _load_players(self):
-        path = self.data_dir / "players_youth.csv"
-        frame = pd.read_csv(path, encoding="utf-8-sig", dtype={"player_id": str})
-        frame["birth_year"] = pd.to_numeric(frame["birth_year"], errors="coerce").astype(
-            "Int64"
-        )
-        log.info("loaded %s players", len(frame))
-        return {row["player_id"]: row for row in frame.to_dict("records")}
+        raise NotImplementedError
 
     def _load_season_rows(self):
-        path = self.data_dir / "player_season_stats.csv"
-        frame = pd.read_csv(
-            path,
-            encoding="utf-8-sig",
-            dtype={"player_id": str, "team_id": str, "league_id": str},
-        )
-        log.info("loaded %s player-season rows", len(frame))
-        return self._normalise_stat_rows(frame, source_name=path.name)
+        raise NotImplementedError
 
     def _load_history_rows(self):
-        """Load historical rows, retaining their source-level availability metadata."""
-        path = self.data_dir / "player_history.csv"
-        if not path.exists():
-            log.warning("%s missing; player pages will show detailed seasons only", path.name)
-            return []
-        frame = pd.read_csv(
-            path,
-            encoding="utf-8-sig",
-            dtype={"player_id": str, "team_id": str, "league_id": str},
-        )
-        # The full historical export intentionally records players who are no longer
-        # in the recent scouting dataset.  They cannot be opened through this
-        # dashboard, so retaining their hundreds of thousands of dictionaries in the
-        # web process serves nobody and can prevent a small deployment from booting.
-        frame = frame[frame["player_id"].isin(self.players)].copy()
-        log.info("loaded %s historical player-team-season rows", len(frame))
-        return self._normalise_stat_rows(frame, source_name=path.name)
+        raise NotImplementedError
+
+    def _load_locations(self):
+        raise NotImplementedError
+
+    def _load_details(self):
+        raise NotImplementedError
 
     @staticmethod
     def _normalise_stat_rows(frame, source_name):
@@ -219,27 +297,6 @@ class ScoutingData:
                 row[field] = value
             rows.append(row)
         return rows
-
-    def _load_locations(self):
-        path = self.data_dir / "team_locations.csv"
-        if not path.exists():
-            log.warning("%s missing; the map will be empty", path.name)
-            return {}
-        frame = pd.read_csv(path, encoding="utf-8-sig", dtype={"team_id": str})
-        return {row["team_id"]: row for row in frame.to_dict("records")}
-
-    def _load_details(self):
-        path = self.data_dir / "player_details.csv"
-        if not path.exists():
-            return {}
-        frame = pd.read_csv(path, encoding="utf-8-sig", dtype={"player_id": str})
-        details = {}
-        for row in frame.to_dict("records"):
-            year = _clean(row.get("birth_year"))
-            details[row["player_id"]] = {
-                "birth_year": int(year) if year is not None else None,
-            }
-        return details
 
     def search(
         self,
@@ -289,26 +346,30 @@ class ScoutingData:
             return None
 
         stats_rows = self.rows_by_player.get(player_id, [])
-        merged = {}
-        for row in [*self.history_by_player.get(player_id, []), *stats_rows]:
-            key = _canonical_key(row)
-            current = merged.get(key)
-            # The detailed recent export is considered the preferred source on a
-            # quality tie.  It is appended second, so replacing on equality prevents
-            # stale history snapshots from shadowing it.
-            if current is None or self._stat_quality(row) >= self._stat_quality(current):
-                merged[key] = row
-            elif current is not None:
-                # Retain a more descriptive context field without combining numeric
-                # values: both sources describe the same IFA aggregate.
-                for field in ("player_name", "team_name", "league_id", "league_name", "age_group"):
-                    if not _text(current.get(field)) and _text(row.get(field)):
-                        current[field] = row[field]
+        # The detailed recent export is considered the preferred source on a
+        # quality tie, so it is passed second -- merge_canonical_rows() keeps
+        # the later row on a tie, which prevents a stale history snapshot from
+        # shadowing it.
+        merged = merge_canonical_rows([*self.history_by_player.get(player_id, []), *stats_rows])
 
         rows = sorted(
             merged.values(),
             key=lambda r: (int(r["season_id"]), _text(r.get("team_name"))),
         )
+
+        # The catalog entry's own name (``player["player_name"]``) only reflects
+        # whatever built that catalog -- the scraper's own recent-season rows for
+        # CsvScoutingData, a plain identity row for PostgresScoutingData -- so a
+        # known name that surfaces only in an older season (e.g. player_history.csv,
+        # or an earlier dataset) would otherwise never reach the player's own
+        # displayed name, even though the exact same row already won the per-season
+        # merge above. Every row's name has already been through that merge, so
+        # ranking them again (newest first, to keep the same tie-break as
+        # elsewhere) picks the best evidence across the player's whole career.
+        _, identity_name = name_quality.best_name(
+            row.get("player_name") for row in reversed(rows)
+        )
+        player_name = identity_name or player["player_name"]
 
         seasons = []
         for row in rows:
@@ -348,7 +409,7 @@ class ScoutingData:
         origin = self._infer_likely_origin(teams, seasons, _clean(player.get("birth_year")))
         return {
             "player_id": player_id,
-            "player_name": player["player_name"],
+            "player_name": player_name,
             "birth_year": _clean(player.get("birth_year")),
             "image_url": _text(player.get("image_url")) or None,
             "current_team": _text(player.get("current_team")),
@@ -375,16 +436,6 @@ class ScoutingData:
             "likely_origin_candidates": origin["candidates"],
             "likely_origin_basis": origin["basis"],
         }
-
-    @staticmethod
-    def _stat_quality(row):
-        """Rank duplicate sources without ever summing the same IFA aggregate twice."""
-        completeness = _text(row.get("stats_completeness"))
-        return {
-            "full": 3,
-            "partial": 2,
-            "unavailable": 1,
-        }.get(completeness, 2 if row.get("stats_available") else 1)
 
     @staticmethod
     def _career_totals(seasons):
@@ -711,12 +762,105 @@ class ScoutingData:
         }
 
 
-def create_app(data_dir=None):
+class CsvScoutingData(BaseScoutingData):
+    """Loads the canonical view from the CSVs in data/ -- the default data source."""
+
+    def __init__(self, data_dir=None):
+        self.data_dir = data_dir or config.DATA_DIR
+        super().__init__()
+
+    def _load_players(self):
+        path = self.data_dir / "players_youth.csv"
+        frame = pd.read_csv(path, encoding="utf-8-sig", dtype={"player_id": str})
+        frame["birth_year"] = pd.to_numeric(frame["birth_year"], errors="coerce").astype(
+            "Int64"
+        )
+        if "name_status" not in frame:
+            # Older, already-generated files predate the name_status column; derive
+            # it from the name itself rather than treating every row as unknown.
+            frame["name_status"] = frame["player_name"].map(name_quality.classify_name)
+        log.info("loaded %s players", len(frame))
+        return {row["player_id"]: row for row in frame.to_dict("records")}
+
+    def _load_season_rows(self):
+        path = self.data_dir / "player_season_stats.csv"
+        frame = pd.read_csv(
+            path,
+            encoding="utf-8-sig",
+            dtype={"player_id": str, "team_id": str, "league_id": str},
+        )
+        log.info("loaded %s player-season rows", len(frame))
+        return self._normalise_stat_rows(frame, source_name=path.name)
+
+    def _load_history_rows(self):
+        """Load historical rows, retaining their source-level availability metadata."""
+        path = self.data_dir / "player_history.csv"
+        if not path.exists():
+            log.warning("%s missing; player pages will show detailed seasons only", path.name)
+            return []
+        frame = pd.read_csv(
+            path,
+            encoding="utf-8-sig",
+            dtype={"player_id": str, "team_id": str, "league_id": str},
+        )
+        # The full historical export intentionally records players who are no longer
+        # in the recent scouting dataset.  They cannot be opened through this
+        # dashboard, so retaining their hundreds of thousands of dictionaries in the
+        # web process serves nobody and can prevent a small deployment from booting.
+        frame = frame[frame["player_id"].isin(self.players)].copy()
+        log.info("loaded %s historical player-team-season rows", len(frame))
+        return self._normalise_stat_rows(frame, source_name=path.name)
+
+    def _load_locations(self):
+        path = self.data_dir / "team_locations.csv"
+        if not path.exists():
+            log.warning("%s missing; the map will be empty", path.name)
+            return {}
+        frame = pd.read_csv(path, encoding="utf-8-sig", dtype={"team_id": str})
+        return {row["team_id"]: row for row in frame.to_dict("records")}
+
+    def _load_details(self):
+        path = self.data_dir / "player_details.csv"
+        if not path.exists():
+            return {}
+        frame = pd.read_csv(path, encoding="utf-8-sig", dtype={"player_id": str})
+        details = {}
+        for row in frame.to_dict("records"):
+            year = _clean(row.get("birth_year"))
+            details[row["player_id"]] = {
+                "birth_year": int(year) if year is not None else None,
+            }
+        return details
+
+
+# Backward-compatible alias: existing code and tests that import ``ScoutingData``
+# directly (it defaults to the CSV source) keep working unchanged.
+ScoutingData = CsvScoutingData
+
+
+def _resolve_data_source(data_dir, data_source):
+    """Pick the concrete BaseScoutingData subclass named by DATA_SOURCE.
+
+    ``postgres_source`` is imported lazily, inside this function, so that the
+    default CSV path works even when psycopg/SQLAlchemy are not installed --
+    the same convention dashboard/auth.py already uses for PostgresUserStore.
+    """
+    source = (data_source or os.environ.get("DATA_SOURCE") or "csv").strip().lower()
+    if source == "csv":
+        return CsvScoutingData(data_dir)
+    if source == "postgres":
+        from .postgres_source import PostgresScoutingData
+
+        return PostgresScoutingData(database_url=os.environ.get("DATABASE_URL"))
+    raise RuntimeError(f"unknown DATA_SOURCE {source!r}; expected 'csv' or 'postgres'")
+
+
+def create_app(data_dir=None, data_source=None):
     app = Flask(__name__, static_folder=None)
     # Refuse to emit NaN/Infinity: they are not valid JSON and the browser's JSON.parse
     # rejects them, so a leak should fail loudly here rather than in the page.
     app.json.allow_nan = False
-    data = ScoutingData(data_dir)
+    data = _resolve_data_source(data_dir, data_source)
 
     @app.get("/")
     def index():
