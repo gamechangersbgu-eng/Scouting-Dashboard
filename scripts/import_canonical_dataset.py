@@ -121,19 +121,44 @@ def _load_season_source(path, source_file):
     -- see dashboard.app_core._canonical_key), so it is logged rather than
     silently dropped; the later of the two rows wins, matching the scraper's
     own "newest observation wins" convention elsewhere.
+
+    Each surviving row also gets ``_source_row_number``: its 0-based position
+    in this exact CSV file, i.e. pandas.read_csv's row order for the same
+    file. This is the only lossless way to reproduce CsvScoutingData's
+    tie-breaking behavior on the Postgres side (see the 0003 migration's
+    docstring) -- BaseScoutingData.player() and ifa_scraper.run.aggregate_players()
+    both do a *stable* sort by (season_id, team_name), and when two rows
+    share both (which happens for real -- two team_ids with the byte-for-byte
+    identical team_name), the stable sort falls through to whatever order the
+    rows arrived in. For CsvScoutingData that is pandas.read_csv's row order;
+    PostgresScoutingData can only reproduce that if the importer records it
+    explicitly, since plain SQL makes no row-order promise at all.
+
+    Critically, this must be the row's *own* file position, not its
+    surviving key's first-seen position: ``seen[key] = row`` on a duplicate
+    natural key overwrites the value but -- since dict key order is
+    insertion order, not last-write order -- leaves the key sitting wherever
+    it first appeared. Enumerating ``seen.values()`` after the loop would
+    therefore hand every de-duplicated row the position of its *first*,
+    discarded occurrence, not the later, actually-kept one. Storing
+    ``(raw_index, row)`` per key instead means a duplicate overwrites both
+    together, so the row that wins the dedup also keeps its own, correct
+    file position.
     """
     seen = {}
     duplicates = 0
-    for row in _read_csv(path):
+    for raw_index, row in enumerate(_read_csv(path)):
         key = (row.get("player_id"), row.get("team_id"), _int_or_none(row.get("season_id")))
         if key in seen:
             duplicates += 1
-        seen[key] = row
+        seen[key] = (raw_index, row)
     if duplicates:
         log.warning("%s: %s duplicate natural-key rows collapsed (kept the later row)", path.name, duplicates)
-    rows = list(seen.values())
-    for row in rows:
+    rows = []
+    for raw_index, row in seen.values():
         row["_source_file"] = source_file
+        row["_source_row_number"] = raw_index
+        rows.append(row)
     return rows
 
 
@@ -285,6 +310,57 @@ def _upsert_venues_and_teams(cursor, all_rows, data_dir):
         team_rows,
     )
     log.info("phase teams: %.3fs (%s rows)", time.perf_counter() - team_start, len(team_rows))
+
+
+def _upsert_dataset_team_locations(cursor, dataset_id, data_dir):
+    """Snapshot team_locations.csv verbatim, one row per team_id, for this dataset.
+
+    Deliberately NOT sourced from ``_load_venue_sources()``/``venues_by_field``
+    above: that dict is keyed by field_id and only keeps the first
+    team_locations.csv row seen for a shared field_id, which silently
+    discards a real, distinct city for every other team_id at that field
+    (confirmed against this repository's own data -- field_id 48 alone is
+    shared by 11 team_ids, most geocoded to "מג'ד אל כרום" but team_id 6480
+    to a different, more specific "מגדל"; see the 0003 migration's
+    docstring). ``CsvScoutingData._load_locations()`` never goes through that
+    field_id dedup either -- it reads team_locations.csv straight, keyed by
+    team_id -- so this is the only way ``PostgresScoutingData`` can reproduce
+    the same per-team city ``_infer_likely_origin()`` sees. team_id is
+    confirmed unique in this repository's own team_locations.csv (2,774 rows,
+    2,774 distinct team_ids), so no de-duplication policy is needed here.
+    """
+    start = time.perf_counter()
+    location_rows = []
+    for row in _read_csv(data_dir / "team_locations.csv"):
+        team_id = _text_or_none(row.get("team_id"))
+        if not team_id:
+            continue
+        lat_text = _text_or_none(row.get("lat"))
+        lon_text = _text_or_none(row.get("lon"))
+        location_rows.append(
+            (
+                dataset_id,
+                team_id,
+                _text_or_none(row.get("field_id")),
+                _text_or_none(row.get("field_name")),
+                _text_or_none(row.get("city")),
+                _text_or_none(row.get("address")),
+                float(lat_text) if lat_text else None,
+                float(lon_text) if lon_text else None,
+                _text_or_none(row.get("precision")),
+            )
+        )
+    _bulk_copy_rows(
+        cursor,
+        "dataset_team_locations",
+        "dataset_id, team_id, field_id, field_name, city, address, lat, lon, precision",
+        location_rows,
+    )
+    log.info(
+        "phase dataset_team_locations: %.3fs (%s rows)",
+        time.perf_counter() - start, len(location_rows),
+    )
+    return len(location_rows)
 
 
 def _split_league_ids(value):
@@ -517,6 +593,7 @@ def _insert_observations(cursor, dataset_id, all_rows):
                 _optional_bool(row.get("stats_available")),
                 _text_or_none(row.get("stats_source")),
                 _text_or_none(row.get("stats_completeness")),
+                row.get("_source_row_number"),
             )
         )
 
@@ -524,7 +601,7 @@ def _insert_observations(cursor, dataset_id, all_rows):
     row_count = _bulk_copy_rows(
         cursor,
         "player_team_season_observations",
-        "dataset_id, player_id, team_id, season_id, source_file, player_name, team_name, age_group, league_name, games, goals, minutes, starts, sub_on, sub_off, yellow_cards_league_cup, yellow_cards_toto, red_cards, stats_available, stats_source, stats_completeness",
+        "dataset_id, player_id, team_id, season_id, source_file, player_name, team_name, age_group, league_name, games, goals, minutes, starts, sub_on, sub_off, yellow_cards_league_cup, yellow_cards_toto, red_cards, stats_available, stats_source, stats_completeness, source_row_number",
         payload,
     )
     log.info(
@@ -568,6 +645,7 @@ def import_dataset(database_url=None, data_dir=None, scraper_git_sha=None):
             _set_local_statement_timeout(cursor)
             _upsert_seasons(cursor, all_rows)
             _upsert_venues_and_teams(cursor, all_rows, data_dir)
+            _upsert_dataset_team_locations(cursor, dataset_id, data_dir)
             _upsert_players(cursor, all_rows, data_dir)
             _upsert_leagues_and_memberships(cursor, dataset_id, all_rows)
             # Observations first: they must record every raw row regardless of

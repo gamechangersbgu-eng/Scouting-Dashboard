@@ -20,9 +20,21 @@ published. See the canonical schema migration's "Rollback reproducibility"
 section for exactly what that does and does not affect (short version: the
 player identity name shown here is derived from this dataset's own fact
 rows, not the dimension row, so it is not actually a rollback risk;
-birth_year/image_url and a team's current venue are treated as "always show
-latest known" reference data, matching the CSV pipeline's existing venue
-behavior and IFA's own single-value team-venue data).
+birth_year/image_url are treated as "always show latest known" reference
+data, matching the CSV pipeline's existing behavior).
+
+``teams``/``venues`` are NOT what ``_load_locations()`` reads, though --
+``venues`` is deduplicated by field_id (multiple team_ids can share one
+physical field, and ``team_locations.csv`` genuinely geocodes some of them to
+different cities -- see the 0003 migration's docstring), which is not how
+``CsvScoutingData._load_locations()`` reads ``team_locations.csv`` at all (it
+is keyed by team_id, verbatim, no dedup). ``_load_locations()`` below reads
+the dataset-versioned ``dataset_team_locations`` table instead -- one row per
+team_id, snapshotted from ``team_locations.csv`` at import time -- which also
+means a dataset rollback's location data is reproducible: it can no longer
+change just because ``team_locations.csv`` was re-geocoded after that dataset
+was imported (the same rollback-reproducibility property 0001 already gives
+``player_team_seasons``).
 
 ``player_team_seasons`` is one row per (player_id, team_id, season_id) --
 never per source_file, which is provenance only (which CSV source's stats
@@ -66,6 +78,15 @@ log = logging.getLogger(__name__)
 # table records every source's row before any merge happens (see the 0002
 # migration), which is what a faithful CSV-equivalent read path needs. See
 # the 0002 migration's docstring for the full "why".
+#
+# ORDER BY o.source_row_number is not cosmetic: BaseScoutingData.player() does
+# a *stable* sort by (season_id, team_name), and two rows genuinely can tie on
+# both (two team_ids sharing the exact same team_name in the same season --
+# confirmed in this repository's own data, see the 0003 migration's
+# docstring) -- the stable sort then falls through to whatever order the rows
+# arrived in. CsvScoutingData gets that from pandas.read_csv's file order;
+# without this ORDER BY, a plain SQL SELECT makes no such promise at all, so
+# ties could resolve to a different "first club" than the CSV picks.
 _SEASON_ROW_SQL = """
     SELECT
         o.player_id,
@@ -100,6 +121,7 @@ _SEASON_ROW_SQL = """
          AND tsl.team_id = o.team_id
          AND tsl.season_id = o.season_id
     WHERE o.dataset_id = %(dataset_id)s AND o.source_file = %(source_file)s
+    ORDER BY o.source_row_number
 """
 
 
@@ -148,6 +170,12 @@ class PostgresScoutingData(BaseScoutingData):
         # the full story); the cross-source known-name recovery that
         # player_history.csv *does* contribute happens later, in player() itself.
         #
+        # ORDER BY o.source_row_number below matters here too:
+        # aggregate_players() does its own stable sort by (-season_id,
+        # team_name), so a player's current_team can depend on row order the
+        # same way player()'s first-club tie-break does -- see the 0003
+        # migration's docstring.
+        #
         # Deliberately not routed through _normalise_stat_rows/pandas:
         # aggregate_players() expects plain Python None/int/str values (it does
         # `row[field] or 0` and calls .split(", ") on age_group/league_name
@@ -168,6 +196,7 @@ class PostgresScoutingData(BaseScoutingData):
                     FROM player_team_season_observations o
                     JOIN seasons s ON s.season_id = o.season_id
                     WHERE o.dataset_id = %s AND o.source_file = 'player_season_stats'
+                    ORDER BY o.source_row_number
                     """,
                     (self.dataset_id,),
                 )
@@ -228,14 +257,26 @@ class PostgresScoutingData(BaseScoutingData):
         )
 
     def _load_locations(self):
+        # Reads dataset_team_locations, NOT teams/venues: those two are kept
+        # as latest-known dimensions (see the module docstring above) and
+        # venues is deduplicated by field_id, which silently discards a real,
+        # distinct team_locations.csv city for every team_id that shares a
+        # field with some other team -- confirmed in this repository's own
+        # data (field_id 48 alone is home to 11 different team_ids that don't
+        # all geocode to the same city). CsvScoutingData._load_locations()
+        # never goes through any field_id dedup either -- it reads
+        # team_locations.csv straight, keyed by team_id -- so
+        # dataset_team_locations (see the 0003 migration) is the only way to
+        # reproduce that per-team city for _career_track()/_infer_likely_origin().
         with db.connect(self.database_url) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT t.team_id, v.field_name, v.city, v.address, v.lat, v.lon, v.precision
-                    FROM teams t
-                    JOIN venues v ON v.field_id = t.current_field_id
-                    """
+                    SELECT team_id, field_name, city, address, lat, lon, precision
+                    FROM dataset_team_locations
+                    WHERE dataset_id = %s
+                    """,
+                    (self.dataset_id,),
                 )
                 columns = ["team_id", "field_name", "city", "address", "lat", "lon", "precision"]
                 return {row[0]: dict(zip(columns, row)) for row in cursor.fetchall()}

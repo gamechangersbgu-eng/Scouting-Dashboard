@@ -27,6 +27,7 @@ from scripts.import_canonical_dataset import (
     _optional_bool,
     _set_local_statement_timeout,
     _text_or_none,
+    _upsert_dataset_team_locations,
     _upsert_leagues_and_memberships,
     _upsert_players,
 )
@@ -422,8 +423,8 @@ class InsertObservationsTests(unittest.TestCase):
         (row,) = self._observation_rows(cursor)
         # dataset_id, player_id, team_id, season_id, source_file, player_name,
         # team_name, age_group, league_name, games..red_cards (9 fields),
-        # stats_available, stats_source, stats_completeness
-        stats_available, stats_source, stats_completeness = row[-3:]
+        # stats_available, stats_source, stats_completeness, source_row_number
+        stats_available, stats_source, stats_completeness = row[18:21]
         self.assertIsNone(stats_available)
         self.assertIsNone(stats_source)
         self.assertIsNone(stats_completeness)
@@ -433,6 +434,175 @@ class InsertObservationsTests(unittest.TestCase):
         self.assertIsNone(_optional_bool(None))
         self.assertTrue(_optional_bool("true"))
         self.assertFalse(_optional_bool("false"))
+
+    def test_source_row_number_is_written_as_the_last_column(self):
+        # See the 0003 migration: source_row_number is what lets
+        # PostgresScoutingData reproduce CsvScoutingData's CSV-file-order
+        # tie-break (BaseScoutingData.player()'s stable sort by
+        # (season_id, team_name) falls through to it when two rows share both).
+        row = {
+            "player_id": "p1", "team_id": "t1", "season_id": "10",
+            "player_name": "Name", "team_name": "Club", "league_name": "League",
+            "age_group": "Youth", "games": "5", "goals": "1", "minutes": "300",
+            "starts": "4", "sub_on": "0", "sub_off": "1",
+            "yellow_cards_league_cup": "0", "yellow_cards_toto": "0", "red_cards": "0",
+            "_source_file": "player_season_stats", "_source_row_number": 7,
+        }
+        cursor = _FakeCursor()
+        _insert_observations(cursor, dataset_id=1, all_rows=[row])
+        (observation_row,) = self._observation_rows(cursor)
+        self.assertEqual(observation_row[-1], 7)
+
+
+class LoadSeasonSourceRowNumberTests(unittest.TestCase):
+    """_load_season_source() must record each surviving row's file position.
+
+    This is the only lossless way to reproduce CsvScoutingData's CSV-file-order
+    tie-break on the Postgres side -- see the 0003 migration's docstring, and
+    tests/test_row_order_and_locations.py for the end-to-end regression using
+    real repository data (player_id 160443, 206511, 227243).
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.data_dir = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _write(self, name, header, rows):
+        import csv
+
+        with (self.data_dir / name).open("w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(header)
+            writer.writerows(rows)
+
+    def test_row_numbers_are_zero_based_and_follow_file_order(self):
+        header = ["player_id", "team_id", "season_id", "team_name"]
+        self._write(
+            "rows.csv",
+            header,
+            [
+                ["p1", "t1", "16", "Club A"],
+                ["p1", "t2", "16", "Club A"],  # tied team_name, different team_id
+                ["p2", "t3", "16", "Club B"],
+            ],
+        )
+        rows = _load_season_source(self.data_dir / "rows.csv", "player_history")
+        numbers_by_team = {r["team_id"]: r["_source_row_number"] for r in rows}
+        self.assertEqual(numbers_by_team, {"t1": 0, "t2": 1, "t3": 2})
+
+    def test_row_number_reflects_the_surviving_row_not_the_first_occurrence(self):
+        # A duplicate natural key keeps the LATER row's values (see the
+        # docstring's "newest observation wins" convention) -- its
+        # _source_row_number must be that same later row's own raw file
+        # position, not the position of the earlier, discarded occurrence
+        # dict.__setitem__ on an existing key would otherwise leave it stuck
+        # at (dict key order is insertion order, not last-write order).
+        header = ["player_id", "team_id", "season_id", "player_name"]
+        self._write(
+            "dup.csv",
+            header,
+            [
+                ["p1", "t1", "16", "Old"],   # raw index 0, discarded
+                ["p2", "t2", "16", "Other"],  # raw index 1
+                ["p1", "t1", "16", "New"],   # raw index 2, duplicate of row 0, survives
+            ],
+        )
+        rows = _load_season_source(self.data_dir / "dup.csv", "player_season_stats")
+        self.assertEqual(len(rows), 2)
+        p1_row = next(r for r in rows if r["player_id"] == "p1")
+        p2_row = next(r for r in rows if r["player_id"] == "p2")
+        self.assertEqual(p1_row["player_name"], "New")
+        # The whole point: p1's surviving row is positioned AFTER p2's, since
+        # it physically appears later in the file (raw index 2 vs 1) -- a
+        # naive "enumerate after dedup" implementation would instead give p1
+        # position 0 (its first, discarded occurrence's dict-insertion slot).
+        self.assertEqual(p1_row["_source_row_number"], 2)
+        self.assertEqual(p2_row["_source_row_number"], 1)
+
+    def test_row_number_orders_correctly_against_a_row_between_the_two_occurrences(self):
+        # The scenario that a naive post-dedup enumerate() gets wrong: a
+        # third, distinct-key row sits between a duplicate key's first and
+        # second occurrence. The surviving (later) row must still sort AFTER
+        # that in-between row, matching real CSV-file order.
+        header = ["player_id", "team_id", "season_id", "player_name"]
+        self._write(
+            "interleaved.csv",
+            header,
+            [
+                ["p1", "t1", "16", "Old"],     # raw index 0, discarded
+                ["p2", "t2", "16", "Other"],   # raw index 1
+                ["p3", "t3", "16", "Third"],   # raw index 2
+                ["p1", "t1", "16", "New"],     # raw index 3, duplicate of row 0, survives
+            ],
+        )
+        rows = _load_season_source(self.data_dir / "interleaved.csv", "player_history")
+        numbers = {r["player_id"]: r["_source_row_number"] for r in rows}
+        self.assertEqual(numbers, {"p1": 3, "p2": 1, "p3": 2})
+        # p1 (the surviving duplicate) must rank after p3, not before it.
+        self.assertGreater(numbers["p1"], numbers["p3"])
+
+
+class UpsertDatasetTeamLocationsTests(unittest.TestCase):
+    """dataset_team_locations must mirror team_locations.csv verbatim, per team_id.
+
+    Unlike _upsert_venues_and_teams()/_load_venue_sources() (which dedupe by
+    field_id and can only keep one team's city for every field), this must
+    never drop a team's own row just because another team shares its field --
+    see the 0003 migration's docstring for the real repository example
+    (field_id 48, 11 team_ids, two different cities).
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.data_dir = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _write_team_locations(self, rows):
+        import csv
+
+        header = ["team_id", "team_name", "field_id", "field_name", "address", "city", "district", "lat", "lon", "geocode_query", "precision"]
+        with (self.data_dir / "team_locations.csv").open("w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.DictWriter(handle, fieldnames=header)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    def test_two_teams_sharing_a_field_id_keep_their_own_distinct_city(self):
+        # Reproduces field_id 48 (this repository's own data): most teams
+        # geocode to the field's own locality, but one team_id's own row
+        # resolves to a different, real city -- both must survive.
+        self._write_team_locations(
+            [
+                {"team_id": "2772", "team_name": "Club Field", "field_id": "48", "field_name": "Shared Field", "address": "Shared Field", "city": "Field City", "district": "North", "lat": "32.92", "lon": "35.25", "geocode_query": "Shared Field", "precision": "fallback"},
+                {"team_id": "6480", "team_name": "Club Own", "field_id": "48", "field_name": "Shared Field", "address": "Shared Field", "city": "Own City", "district": "North", "lat": "32.83", "lon": "35.50", "geocode_query": "Own City", "precision": "locality"},
+            ]
+        )
+        cursor = _FakeCursor()
+        count = _upsert_dataset_team_locations(cursor, dataset_id=1, data_dir=self.data_dir)
+        self.assertEqual(count, 2)
+        inserted = {
+            params[1]: params  # team_id -> full row
+            for sql, params in cursor.calls
+            if sql.startswith("INSERT INTO dataset_team_locations")
+        }
+        self.assertEqual(set(inserted), {"2772", "6480"})
+        # (dataset_id, team_id, field_id, field_name, city, address, lat, lon, precision)
+        self.assertEqual(inserted["2772"][4], "Field City")
+        self.assertEqual(inserted["6480"][4], "Own City")
+        self.assertEqual(inserted["6480"][6], 32.83)
+
+    def test_missing_file_inserts_nothing(self):
+        cursor = _FakeCursor()
+        count = _upsert_dataset_team_locations(cursor, dataset_id=1, data_dir=self.data_dir)
+        self.assertEqual(count, 0)
+        self.assertEqual(
+            [c for c in cursor.calls if c[0].startswith("INSERT INTO dataset_team_locations")],
+            [],
+        )
 
 
 if __name__ == "__main__":

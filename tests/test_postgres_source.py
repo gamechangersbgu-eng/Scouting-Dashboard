@@ -18,7 +18,7 @@ from unittest import mock
 
 import pandas as pd
 
-from dashboard.postgres_source import PostgresScoutingData
+from dashboard.postgres_source import _SEASON_ROW_SQL, PostgresScoutingData
 
 # Markers must not be substrings of one another's SQL text -- see the two
 # "FROM players" queries below, which differ only by ", image_url".
@@ -32,7 +32,13 @@ from dashboard.postgres_source import PostgresScoutingData
 PLAYER_SEASON_ROWS_MARKER = "FROM player_team_season_observations o"
 PLAYER_DETAILS_WITH_IMAGE_MARKER = "birth_year, image_url FROM players"
 PLAYER_BIRTH_YEAR_ONLY_MARKER = "SELECT player_id, birth_year FROM players"
-TEAM_VENUE_MARKER = "FROM teams t"
+# _load_locations() reads dataset_team_locations, NOT teams/venues (see the
+# 0003 migration and dashboard/postgres_source.py's module docstring: the
+# teams/venues join deduplicates by field_id, which silently drops a team's
+# own city whenever it shares a field with another team). Column order is
+# unchanged from the old teams/venues query, so existing fixture tuples below
+# still apply verbatim.
+TEAM_VENUE_MARKER = "FROM dataset_team_locations"
 
 _P1_MASKED_RECENT_ROW = (
     # player_id, player_name, season_id, season, team_id, team_name, age_group,
@@ -51,8 +57,10 @@ class _RoutingCursor:
     def __init__(self, rows_by_marker):
         self.rows_by_marker = rows_by_marker
         self._rows = []
+        self.executed_sql = []
 
     def execute(self, sql, params=None):
+        self.executed_sql.append(sql)
         for marker, rows in self.rows_by_marker.items():
             if marker in sql:
                 self._rows = rows
@@ -72,15 +80,26 @@ class _RoutingCursor:
 class _FakeConnection:
     def __init__(self, rows_by_marker):
         self.rows_by_marker = rows_by_marker
+        # One shared cursor rather than a fresh one per `with connection.cursor()`
+        # block, so executed_sql accumulates across every query PostgresScoutingData
+        # issues over this connection's lifetime -- needed to assert on SQL text
+        # (e.g. an ORDER BY clause) issued from a block other tests don't otherwise
+        # care about.
+        self._cursor = _RoutingCursor(self.rows_by_marker)
 
     def cursor(self):
-        return _RoutingCursor(self.rows_by_marker)
+        return self._cursor
 
     def __enter__(self):
         return self
 
     def __exit__(self, *exc_info):
         return False
+
+
+class SeasonRowSqlTests(unittest.TestCase):
+    def test_season_row_sql_orders_by_source_row_number(self):
+        self.assertIn("ORDER BY o.source_row_number", _SEASON_ROW_SQL)
 
 
 class PostgresScoutingDataTests(unittest.TestCase):
@@ -152,6 +171,49 @@ class PostgresScoutingDataTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "no dataset is currently published"):
                 PostgresScoutingData(database_url="postgresql://fake/fake")
+
+    def test_catalog_query_orders_by_source_row_number(self):
+        # Smoke check that the ORDER BY survives edits to _load_players()'s
+        # raw-cursor query text -- the fakes below never execute real SQL, so
+        # this cannot catch a broken ORDER BY the way a real Postgres instance
+        # would (see this module's own docstring on that limitation), but it
+        # does catch someone deleting the clause outright. The actual
+        # ordering behavior is exercised end-to-end with real data in
+        # tests/test_row_order_and_locations.py.
+        connection = _FakeConnection(
+            {
+                PLAYER_SEASON_ROWS_MARKER: [_P1_MASKED_RECENT_ROW],
+                PLAYER_DETAILS_WITH_IMAGE_MARKER: [("p1", 2011, "")],
+                PLAYER_BIRTH_YEAR_ONLY_MARKER: [("p1", 2011)],
+                TEAM_VENUE_MARKER: [],
+            }
+        )
+        minimal_frame = pd.DataFrame(
+            [
+                {
+                    "player_id": "p1", "player_name": "*******", "season_id": 26,
+                    "season": "2024/25", "team_id": "t1", "team_name": "Hapoel Kiryat Gat",
+                    "league_id": "101", "age_group": "נוער", "league_name": "ליגת העל לנוער",
+                    "games": 10, "goals": 2, "minutes": 600, "starts": 8, "sub_on": 1,
+                    "sub_off": 2, "yellow_cards_league_cup": 1, "yellow_cards_toto": 0,
+                    "red_cards": 0, "stats_available": True,
+                    "stats_source": "team_player_statistics", "stats_completeness": "full",
+                }
+            ]
+        )
+        with mock.patch(
+            "dashboard.postgres_source.db.connect", return_value=connection
+        ), mock.patch(
+            "dashboard.postgres_source.db.current_dataset_id", return_value=7
+        ), mock.patch.object(
+            PostgresScoutingData, "_read_season_rows", return_value=minimal_frame
+        ):
+            PostgresScoutingData(database_url="postgresql://fake/fake")
+
+        catalog_sql = next(
+            sql for sql in connection._cursor.executed_sql if PLAYER_SEASON_ROWS_MARKER in sql
+        )
+        self.assertIn("ORDER BY o.source_row_number", catalog_sql)
 
     def test_load_players_uses_aggregate_players_over_season_stats_only(self):
         data = self._make()
@@ -305,6 +367,20 @@ class PostgresScoutingDataTests(unittest.TestCase):
     def test_load_locations_omits_teams_without_a_current_venue(self):
         data = self._make(team_venue_rows=[])
         self.assertEqual(data.locations, {})
+
+    def test_load_locations_keeps_distinct_cities_for_teams_sharing_a_field(self):
+        # dataset_team_locations is keyed by team_id, not field_id -- two
+        # team_ids can (and in this repository's own data, do: field_id 48)
+        # share a physical field but geocode to different real cities. Since
+        # this query never groups by field, both must come back unmodified.
+        data = self._make(
+            team_venue_rows=[
+                ("t1", "Shared Field", "Field City", "", 32.92, 35.25, "fallback"),
+                ("t2", "Shared Field", "Own City", "", 32.83, 35.50, "locality"),
+            ]
+        )
+        self.assertEqual(data.locations["t1"]["city"], "Field City")
+        self.assertEqual(data.locations["t2"]["city"], "Own City")
 
     def test_load_details_maps_birth_years(self):
         data = self._make(player_birth_rows=[("p1", 2011)])
