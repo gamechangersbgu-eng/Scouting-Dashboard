@@ -21,8 +21,10 @@ from scripts.import_canonical_dataset import (
     _int_or_none,
     _load_season_source,
     _load_venue_sources,
+    _set_local_statement_timeout,
     _text_or_none,
     _upsert_leagues_and_memberships,
+    _upsert_players,
 )
 
 
@@ -131,13 +133,21 @@ class _FakeCursor:
 
     def __init__(self):
         self.calls = []
+        self.executemany_calls = []
+        self.fetchall_result = []
 
     def execute(self, sql, params=None):
         self.calls.append((" ".join(sql.split()), params))
+        if sql.startswith("SELECT player_id, name_status FROM players"):
+            self._last_select = self.fetchall_result
 
     def executemany(self, sql, seq_of_params):
+        self.executemany_calls.append((" ".join(sql.split()), list(seq_of_params)))
         for params in seq_of_params:
             self.execute(sql, params)
+
+    def fetchall(self):
+        return self.fetchall_result
 
 
 def _leagues_upserted(cursor):
@@ -196,6 +206,34 @@ class UpsertLeaguesAndMembershipsTests(unittest.TestCase):
         self.assertEqual(leagues[740], "League 740")
 
 
+class BulkPlayerUpsertTests(unittest.TestCase):
+    def test_local_statement_timeout_is_set_before_bulk_import_work(self):
+        cursor = _FakeCursor()
+        _set_local_statement_timeout(cursor)
+        self.assertEqual(cursor.calls[0][0], "SET LOCAL statement_timeout = '30min'")
+
+    def test_known_name_invariant_is_preserved_with_bulk_updates(self):
+        cursor = _FakeCursor()
+        cursor.fetchall_result = [("p1", "known")]
+        data_dir = Path(tempfile.mkdtemp())
+        (data_dir / "player_details.csv").write_text(
+            "player_id,birth_year,image_url\np1,2000,https://example.com/p1.jpg\n",
+            encoding="utf-8",
+        )
+
+        _upsert_players(
+            cursor,
+            [{"player_id": "p1", "player_name": "*******"}],
+            data_dir,
+        )
+
+        self.assertTrue(cursor.executemany_calls)
+        update_calls = [c for c in cursor.executemany_calls if c[0].startswith("UPDATE players SET")]
+        self.assertEqual(len(update_calls), 1)
+        self.assertEqual(update_calls[0][1][0][2], "p1")
+        self.assertEqual(update_calls[0][1][0][0], 2000)
+
+
 class MergeBeforeInsertTests(unittest.TestCase):
     """The importer must insert at most one row per (player, team, season)."""
 
@@ -221,7 +259,7 @@ class MergeBeforeInsertTests(unittest.TestCase):
         self.assertEqual(len(insert_calls), 1)
         # The masked recent row is preferred on stats (a tie here), but the
         # known name from history must still be what gets inserted.
-        self.assertEqual(insert_calls[0][1]["player_name"], "Real Name")
+        self.assertEqual(insert_calls[0][1][5], "Real Name")
 
 
 if __name__ == "__main__":

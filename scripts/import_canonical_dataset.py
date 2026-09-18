@@ -51,6 +51,7 @@ import argparse
 import csv
 import json
 import logging
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -119,22 +120,57 @@ def _load_season_source(path, source_file):
     return rows
 
 
+def _set_local_statement_timeout(cursor):
+    # Scope this to the importer transaction only; it is reset automatically at
+    # COMMIT/ROLLBACK and does not alter the database-wide statement_timeout.
+    cursor.execute("SET LOCAL statement_timeout = '30min'")
+
+
+def _bulk_insert_many(cursor, sql, rows):
+    if not rows:
+        return 0
+    if hasattr(cursor, "executemany"):
+        cursor.executemany(sql, rows)
+        return len(rows)
+    for row in rows:
+        cursor.execute(sql, row)
+    return len(rows)
+
+
+def _bulk_copy_rows(cursor, table_name, columns, rows):
+    if not rows:
+        return 0
+    if hasattr(cursor, "copy"):
+        with cursor.copy(f"COPY {table_name} ({columns}) FROM STDIN") as copy:
+            for row in rows:
+                copy.write_row(row)
+        return len(rows)
+    placeholders = ", ".join(["%s"] * len(columns.split(", ")))
+    cursor.executemany(
+        f"INSERT INTO {table_name} ({columns}) VALUES ({placeholders})",
+        rows,
+    )
+    return len(rows)
+
+
 def _upsert_seasons(cursor, all_rows):
+    start = time.perf_counter()
     seasons = {}
     for row in all_rows:
         season_id = _int_or_none(row.get("season_id"))
         label = _text_or_none(row.get("season"))
         if season_id is not None and label:
             seasons[season_id] = label
-    for season_id, label in seasons.items():
-        cursor.execute(
-            """
-            INSERT INTO seasons (season_id, label) VALUES (%s, %s)
-            ON CONFLICT (season_id) DO UPDATE SET label = EXCLUDED.label
-            """,
-            (season_id, label),
-        )
-    log.info("upserted %s seasons", len(seasons))
+    season_rows = [(season_id, label) for season_id, label in seasons.items()]
+    _bulk_insert_many(
+        cursor,
+        """
+        INSERT INTO seasons (season_id, label) VALUES (%s, %s)
+        ON CONFLICT (season_id) DO UPDATE SET label = EXCLUDED.label
+        """,
+        season_rows,
+    )
+    log.info("phase seasons: %.3fs (%s rows)", time.perf_counter() - start, len(season_rows))
 
 
 def _load_venue_sources(data_dir):
@@ -166,38 +202,45 @@ def _load_venue_sources(data_dir):
 
 
 def _upsert_venues_and_teams(cursor, all_rows, data_dir):
+    start = time.perf_counter()
     team_fields, venues_by_field = _load_venue_sources(data_dir)
 
     distinct_field_ids = {mapping["field_id"] for mapping in team_fields.values()}
+    venue_rows = []
     for field_id in distinct_field_ids:
         geocoded = venues_by_field.get(field_id, {})
         field_name = geocoded.get("field_name") or next(
             (m["field_name"] for m in team_fields.values() if m["field_id"] == field_id), None
         )
-        cursor.execute(
-            """
-            INSERT INTO venues (field_id, field_name, city, address, lat, lon, precision)
-            VALUES (%(field_id)s, %(field_name)s, %(city)s, %(address)s, %(lat)s, %(lon)s, %(precision)s)
-            ON CONFLICT (field_id) DO UPDATE SET
-                field_name = EXCLUDED.field_name,
-                city = EXCLUDED.city,
-                address = EXCLUDED.address,
-                lat = EXCLUDED.lat,
-                lon = EXCLUDED.lon,
-                precision = EXCLUDED.precision
-            """,
-            {
-                "field_id": field_id,
-                "field_name": field_name,
-                "city": geocoded.get("city"),
-                "address": geocoded.get("address"),
-                "lat": geocoded.get("lat"),
-                "lon": geocoded.get("lon"),
-                "precision": geocoded.get("precision"),
-            },
+        venue_rows.append(
+            (
+                field_id,
+                field_name,
+                geocoded.get("city"),
+                geocoded.get("address"),
+                geocoded.get("lat"),
+                geocoded.get("lon"),
+                geocoded.get("precision"),
+            )
         )
-    log.info("upserted %s venues", len(distinct_field_ids))
+    _bulk_insert_many(
+        cursor,
+        """
+        INSERT INTO venues (field_id, field_name, city, address, lat, lon, precision)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (field_id) DO UPDATE SET
+            field_name = EXCLUDED.field_name,
+            city = EXCLUDED.city,
+            address = EXCLUDED.address,
+            lat = EXCLUDED.lat,
+            lon = EXCLUDED.lon,
+            precision = EXCLUDED.precision
+        """,
+        venue_rows,
+    )
+    log.info("phase venues: %.3fs (%s rows)", time.perf_counter() - start, len(venue_rows))
 
+    team_start = time.perf_counter()
     # Newest season first per team_id, so the most recent team_name wins --
     # the same convention ifa_scraper.run.aggregate_players uses for a
     # player's current_team.
@@ -207,21 +250,24 @@ def _upsert_venues_and_teams(cursor, all_rows, data_dir):
         if team_id:
             rows_by_team[team_id].append(row)
 
+    team_rows = []
     for team_id, rows in rows_by_team.items():
         rows.sort(key=lambda r: -(_int_or_none(r.get("season_id")) or 0))
         latest_name = next((_text_or_none(r.get("team_name")) for r in rows if _text_or_none(r.get("team_name"))), team_id)
         field_id = (team_fields.get(team_id) or {}).get("field_id")
-        cursor.execute(
-            """
-            INSERT INTO teams (team_id, latest_name, current_field_id)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (team_id) DO UPDATE SET
-                latest_name = EXCLUDED.latest_name,
-                current_field_id = COALESCE(EXCLUDED.current_field_id, teams.current_field_id)
-            """,
-            (team_id, latest_name, field_id),
-        )
-    log.info("upserted %s teams", len(rows_by_team))
+        team_rows.append((team_id, latest_name, field_id))
+    _bulk_insert_many(
+        cursor,
+        """
+        INSERT INTO teams (team_id, latest_name, current_field_id)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (team_id) DO UPDATE SET
+            latest_name = EXCLUDED.latest_name,
+            current_field_id = COALESCE(EXCLUDED.current_field_id, teams.current_field_id)
+        """,
+        team_rows,
+    )
+    log.info("phase teams: %.3fs (%s rows)", time.perf_counter() - team_start, len(team_rows))
 
 
 def _split_league_ids(value):
@@ -236,6 +282,7 @@ def _upsert_leagues_and_memberships(cursor, dataset_id, all_rows):
     docstring for why only single-valued rows are trusted for id->name
     pairing, while membership (the junction rows) is always safe to record.
     """
+    start = time.perf_counter()
     single_valued_names = {}
     memberships = defaultdict(set)  # (team_id, season_id) -> {league_id, ...}
 
@@ -254,36 +301,40 @@ def _upsert_leagues_and_memberships(cursor, dataset_id, all_rows):
                 single_valued_names[league_ids[0]] = name
 
     all_league_ids = {lid for ids in memberships.values() for lid in ids}
-    for league_id in all_league_ids:
-        name = single_valued_names.get(league_id) or f"League {league_id}"
-        cursor.execute(
-            """
-            INSERT INTO leagues (league_id, latest_name) VALUES (%s, %s)
-            ON CONFLICT (league_id) DO UPDATE SET latest_name = EXCLUDED.latest_name
-            """,
-            (int(league_id), name),
-        )
+    league_rows = [(int(league_id), single_valued_names.get(league_id) or f"League {league_id}") for league_id in all_league_ids]
+    _bulk_insert_many(
+        cursor,
+        """
+        INSERT INTO leagues (league_id, latest_name) VALUES (%s, %s)
+        ON CONFLICT (league_id) DO UPDATE SET latest_name = EXCLUDED.latest_name
+        """,
+        league_rows,
+    )
     log.info(
-        "upserted %s leagues (%s resolved from an unambiguous single-league row)",
-        len(all_league_ids), len(single_valued_names),
+        "phase leagues: %.3fs (%s rows, %s resolved from an unambiguous single-league row)",
+        time.perf_counter() - start,
+        len(league_rows),
+        len(single_valued_names),
     )
 
-    membership_count = 0
+    membership_rows = []
     for (team_id, season_id), league_ids in memberships.items():
         for league_id in league_ids:
-            cursor.execute(
-                """
-                INSERT INTO team_season_leagues (dataset_id, team_id, season_id, league_id)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (dataset_id, team_id, season_id, league_id) DO NOTHING
-                """,
-                (dataset_id, team_id, season_id, int(league_id)),
-            )
-            membership_count += 1
-    log.info("inserted %s team_season_leagues rows", membership_count)
+            membership_rows.append((dataset_id, team_id, season_id, int(league_id)))
+    _bulk_insert_many(
+        cursor,
+        """
+        INSERT INTO team_season_leagues (dataset_id, team_id, season_id, league_id)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (dataset_id, team_id, season_id, league_id) DO NOTHING
+        """,
+        membership_rows,
+    )
+    log.info("phase team_season_leagues: %.3fs (%s rows)", time.perf_counter() - start, len(membership_rows))
 
 
 def _upsert_players(cursor, all_rows, data_dir):
+    start = time.perf_counter()
     names_by_player = defaultdict(list)
     for row in all_rows:
         player_id = _text_or_none(row.get("player_id"))
@@ -306,46 +357,51 @@ def _upsert_players(cursor, all_rows, data_dir):
     cursor.execute("SELECT player_id, name_status FROM players")
     existing_status = {player_id: status for player_id, status in cursor.fetchall()}
 
-    upserted = 0
+    update_rows = []
+    insert_rows = []
     for player_id, names in names_by_player.items():
         status, name = name_quality.best_name(names)
         previous_status = existing_status.get(player_id)
+        detail = details.get(player_id) or {}
+        payload = {
+            "player_id": player_id,
+            "name": name or player_id,
+            "status": status,
+            "birth_year": detail.get("birth_year"),
+            "image_url": detail.get("image_url"),
+        }
         if previous_status and name_quality.name_rank(previous_status) > name_quality.name_rank(status):
             # Keep the existing (better) name/status; only birth_year/image_url refresh.
-            cursor.execute(
-                """
-                UPDATE players SET
-                    birth_year = COALESCE(%(birth_year)s, birth_year),
-                    image_url = COALESCE(%(image_url)s, image_url)
-                WHERE player_id = %(player_id)s
-                """,
-                {
-                    "player_id": player_id,
-                    "birth_year": (details.get(player_id) or {}).get("birth_year"),
-                    "image_url": (details.get(player_id) or {}).get("image_url"),
-                },
-            )
+            update_rows.append((payload["birth_year"], payload["image_url"], payload["player_id"]))
         else:
-            cursor.execute(
-                """
-                INSERT INTO players (player_id, latest_name, name_status, birth_year, image_url)
-                VALUES (%(player_id)s, %(name)s, %(status)s, %(birth_year)s, %(image_url)s)
-                ON CONFLICT (player_id) DO UPDATE SET
-                    latest_name = EXCLUDED.latest_name,
-                    name_status = EXCLUDED.name_status,
-                    birth_year = COALESCE(EXCLUDED.birth_year, players.birth_year),
-                    image_url = COALESCE(EXCLUDED.image_url, players.image_url)
-                """,
-                {
-                    "player_id": player_id,
-                    "name": name or player_id,
-                    "status": status,
-                    "birth_year": (details.get(player_id) or {}).get("birth_year"),
-                    "image_url": (details.get(player_id) or {}).get("image_url"),
-                },
-            )
-        upserted += 1
-    log.info("upserted %s players", upserted)
+            insert_rows.append((payload["player_id"], payload["name"], payload["status"], payload["birth_year"], payload["image_url"]))
+
+    if update_rows:
+        _bulk_insert_many(
+            cursor,
+            """
+            UPDATE players SET
+                birth_year = COALESCE(%s, birth_year),
+                image_url = COALESCE(%s, image_url)
+            WHERE player_id = %s
+            """,
+            update_rows,
+        )
+    if insert_rows:
+        _bulk_insert_many(
+            cursor,
+            """
+            INSERT INTO players (player_id, latest_name, name_status, birth_year, image_url)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (player_id) DO UPDATE SET
+                latest_name = EXCLUDED.latest_name,
+                name_status = EXCLUDED.name_status,
+                birth_year = COALESCE(EXCLUDED.birth_year, players.birth_year),
+                image_url = COALESCE(EXCLUDED.image_url, players.image_url)
+            """,
+            insert_rows,
+        )
+    log.info("phase players: %.3fs (%s rows)", time.perf_counter() - start, len(names_by_player))
 
 
 def _insert_facts(cursor, dataset_id, merged_rows):
@@ -357,46 +413,45 @@ def _insert_facts(cursor, dataset_id, merged_rows):
     stats won that merge; it is provenance, not part of the table's
     UNIQUE constraint (see the schema migration).
     """
+    start = time.perf_counter()
     payload = []
     for row in merged_rows:
         payload.append(
-            {
-                "dataset_id": dataset_id,
-                "player_id": row.get("player_id"),
-                "team_id": row.get("team_id"),
-                "season_id": _int_or_none(row.get("season_id")),
-                "source_file": row["_source_file"],
-                "player_name": _text_or_none(row.get("player_name")),
-                "name_status": name_quality.classify_name(row.get("player_name")),
-                "team_name": _text_or_none(row.get("team_name")),
-                "age_group": _text_or_none(row.get("age_group")),
-                "league_name": _text_or_none(row.get("league_name")),
-                "stats_available": _bool_from_csv(row.get("stats_available")),
-                "stats_source": _text_or_none(row.get("stats_source")),
-                "stats_completeness": _text_or_none(row.get("stats_completeness")) or "unavailable",
-                **{field: _int_or_none(row.get(field)) for field in FACT_COLUMNS},
-            }
+            (
+                dataset_id,
+                row.get("player_id"),
+                row.get("team_id"),
+                _int_or_none(row.get("season_id")),
+                row["_source_file"],
+                _text_or_none(row.get("player_name")),
+                name_quality.classify_name(row.get("player_name")),
+                _text_or_none(row.get("team_name")),
+                _text_or_none(row.get("age_group")),
+                _text_or_none(row.get("league_name")),
+                _int_or_none(row.get("games")),
+                _int_or_none(row.get("goals")),
+                _int_or_none(row.get("minutes")),
+                _int_or_none(row.get("starts")),
+                _int_or_none(row.get("sub_on")),
+                _int_or_none(row.get("sub_off")),
+                _int_or_none(row.get("yellow_cards_league_cup")),
+                _int_or_none(row.get("yellow_cards_toto")),
+                _int_or_none(row.get("red_cards")),
+                _bool_from_csv(row.get("stats_available")),
+                _text_or_none(row.get("stats_source")),
+                _text_or_none(row.get("stats_completeness")) or "unavailable",
+            )
         )
 
-    cursor.executemany(
-        """
-        INSERT INTO player_team_seasons (
-            dataset_id, player_id, team_id, season_id, source_file, player_name,
-            name_status, team_name, age_group, league_name,
-            games, goals, minutes, starts, sub_on, sub_off,
-            yellow_cards_league_cup, yellow_cards_toto, red_cards,
-            stats_available, stats_source, stats_completeness
-        ) VALUES (
-            %(dataset_id)s, %(player_id)s, %(team_id)s, %(season_id)s, %(source_file)s, %(player_name)s,
-            %(name_status)s, %(team_name)s, %(age_group)s, %(league_name)s,
-            %(games)s, %(goals)s, %(minutes)s, %(starts)s, %(sub_on)s, %(sub_off)s,
-            %(yellow_cards_league_cup)s, %(yellow_cards_toto)s, %(red_cards)s,
-            %(stats_available)s, %(stats_source)s, %(stats_completeness)s
-        )
-        """,
+    copy_start = time.perf_counter()
+    row_count = _bulk_copy_rows(
+        cursor,
+        "player_team_seasons",
+        "dataset_id, player_id, team_id, season_id, source_file, player_name, name_status, team_name, age_group, league_name, games, goals, minutes, starts, sub_on, sub_off, yellow_cards_league_cup, yellow_cards_toto, red_cards, stats_available, stats_source, stats_completeness",
         payload,
     )
-    return len(payload)
+    log.info("phase player_team_seasons COPY: %.3fs (%s rows)", time.perf_counter() - copy_start, row_count)
+    return row_count
 
 
 def import_dataset(database_url=None, data_dir=None, scraper_git_sha=None):
@@ -429,6 +484,7 @@ def import_dataset(database_url=None, data_dir=None, scraper_git_sha=None):
             (dataset_id,) = cursor.fetchone()
             log.info("building dataset_id=%s", dataset_id)
 
+            _set_local_statement_timeout(cursor)
             _upsert_seasons(cursor, all_rows)
             _upsert_venues_and_teams(cursor, all_rows, data_dir)
             _upsert_players(cursor, all_rows, data_dir)
