@@ -88,6 +88,23 @@ def _bool_from_csv(value, default=False):
     return text in {"1", "true", "yes"}
 
 
+def _optional_bool(value):
+    """Like ``_bool_from_csv`` but with no default: absent stays unknown (None).
+
+    Used only for observation rows, which must stay lossless -- a source that
+    never published a ``stats_available`` column (``player_season_stats.csv``,
+    confirmed against this repository's own copy) has to record that absence
+    as SQL NULL, not a coerced ``False``, so that
+    ``BaseScoutingData._normalise_stat_rows`` can still infer it the same way
+    at read time as it does for the CSV itself. See the 0002 migration's
+    docstring.
+    """
+    text = (value or "").strip().lower()
+    if not text:
+        return None
+    return text in {"1", "true", "yes"}
+
+
 def _read_csv(path):
     if not path.exists():
         log.warning("%s missing; treating as zero rows", path.name)
@@ -454,6 +471,70 @@ def _insert_facts(cursor, dataset_id, merged_rows):
     return row_count
 
 
+def _insert_observations(cursor, dataset_id, all_rows):
+    """Insert every raw, unmerged source row into the lossless observation layer.
+
+    Unlike ``_insert_facts`` (which takes ``merged_rows``, at most one per
+    grain), this takes ``all_rows`` -- ``season_rows + history_rows``,
+    entirely unmerged -- and writes one row per (player_id, team_id,
+    season_id, source_file). This must run against the same rows the merge
+    itself consumes, and it must run regardless of what the merge decides,
+    so that both sources stay independently queryable even where their
+    canonical keys collide (49,379 of 49,593 recent rows, in this
+    repository's own data). See the 0002 migration's docstring.
+
+    ``stats_available``/``stats_source``/``stats_completeness`` are written
+    with ``_optional_bool``/``_text_or_none`` (no coerced defaults) rather
+    than ``_bool_from_csv``/``"unavailable"`` fallback used for the merged
+    canonical table -- a source that never published those columns
+    (``player_season_stats.csv``) must record that as NULL here, not a
+    fabricated value, so ``_normalise_stat_rows`` can still infer it
+    correctly at read time exactly as it does for the CSV path.
+    """
+    start = time.perf_counter()
+    payload = []
+    for row in all_rows:
+        payload.append(
+            (
+                dataset_id,
+                row.get("player_id"),
+                row.get("team_id"),
+                _int_or_none(row.get("season_id")),
+                row["_source_file"],
+                _text_or_none(row.get("player_name")),
+                _text_or_none(row.get("team_name")),
+                _text_or_none(row.get("age_group")),
+                _text_or_none(row.get("league_name")),
+                _int_or_none(row.get("games")),
+                _int_or_none(row.get("goals")),
+                _int_or_none(row.get("minutes")),
+                _int_or_none(row.get("starts")),
+                _int_or_none(row.get("sub_on")),
+                _int_or_none(row.get("sub_off")),
+                _int_or_none(row.get("yellow_cards_league_cup")),
+                _int_or_none(row.get("yellow_cards_toto")),
+                _int_or_none(row.get("red_cards")),
+                _optional_bool(row.get("stats_available")),
+                _text_or_none(row.get("stats_source")),
+                _text_or_none(row.get("stats_completeness")),
+            )
+        )
+
+    copy_start = time.perf_counter()
+    row_count = _bulk_copy_rows(
+        cursor,
+        "player_team_season_observations",
+        "dataset_id, player_id, team_id, season_id, source_file, player_name, team_name, age_group, league_name, games, goals, minutes, starts, sub_on, sub_off, yellow_cards_league_cup, yellow_cards_toto, red_cards, stats_available, stats_source, stats_completeness",
+        payload,
+    )
+    log.info(
+        "phase player_team_season_observations COPY: %.3fs (%s rows)",
+        time.perf_counter() - copy_start, row_count,
+    )
+    log.info("phase player_team_season_observations total: %.3fs", time.perf_counter() - start)
+    return row_count
+
+
 def import_dataset(database_url=None, data_dir=None, scraper_git_sha=None):
     data_dir = Path(data_dir) if data_dir else config.DATA_DIR
 
@@ -489,6 +570,11 @@ def import_dataset(database_url=None, data_dir=None, scraper_git_sha=None):
             _upsert_venues_and_teams(cursor, all_rows, data_dir)
             _upsert_players(cursor, all_rows, data_dir)
             _upsert_leagues_and_memberships(cursor, dataset_id, all_rows)
+            # Observations first: they must record every raw row regardless of
+            # what the merge below decides, so a bug in the merge can never
+            # take the lossless layer down with it.
+            observation_count = _insert_observations(cursor, dataset_id, all_rows)
+            log.info("inserted %s player_team_season_observations rows", observation_count)
             fact_count = _insert_facts(cursor, dataset_id, merged_rows)
             log.info("inserted %s player_team_seasons rows", fact_count)
 
@@ -498,6 +584,7 @@ def import_dataset(database_url=None, data_dir=None, scraper_git_sha=None):
                     json.dumps(
                         {
                             "player_team_seasons_rows": fact_count,
+                            "player_team_season_observations_rows": observation_count,
                             "raw_season_rows": len(season_rows),
                             "raw_history_rows": len(history_rows),
                             "rows_merged_away": len(all_rows) - fact_count,

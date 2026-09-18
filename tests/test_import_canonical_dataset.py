@@ -13,14 +13,18 @@ or ``0`` (an empty stat must stay unknown, not become a false zero).
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from dashboard.app_core import merge_canonical_rows
+from scripts.check_parity import run_parity_check
 from scripts.import_canonical_dataset import (
     _bool_from_csv,
     _insert_facts,
+    _insert_observations,
     _int_or_none,
     _load_season_source,
     _load_venue_sources,
+    _optional_bool,
     _set_local_statement_timeout,
     _text_or_none,
     _upsert_leagues_and_memberships,
@@ -234,6 +238,45 @@ class BulkPlayerUpsertTests(unittest.TestCase):
         self.assertEqual(update_calls[0][1][0][0], 2000)
 
 
+class CheckParityPathHandingTests(unittest.TestCase):
+    def test_run_parity_check_accepts_cli_string_data_dir(self):
+        seen = {}
+
+        class DummyCsvData:
+            def __init__(self, data_dir):
+                seen["data_dir"] = data_dir
+                self.data_dir = data_dir
+                self.players = {"1": {"player_name": "Alice"}}
+
+            def player(self, _player_id):
+                return {"player_name": "Alice", "birth_year": None, "current_team": None, "num_teams": 0, "age_groups": [], "leagues": [], "seasons_played": 0, "plays_above_age": False, "age_groups_above": [], "first_club": None, "first_club_city": None, "likely_origin_city": None, "likely_origin_confidence": None, "totals": {}, "seasons": []}
+
+            def summary(self):
+                return {"players": 1, "player_seasons": 0, "above_age": 0}
+
+            def search(self, query, limit=1000):
+                return [{"player_id": "1"}]
+
+        class DummyPgData:
+            def __init__(self, database_url):
+                self.database_url = database_url
+
+            def player(self, _player_id):
+                return {"player_name": "Alice", "birth_year": None, "current_team": None, "num_teams": 0, "age_groups": [], "leagues": [], "seasons_played": 0, "plays_above_age": False, "age_groups_above": [], "first_club": None, "first_club_city": None, "likely_origin_city": None, "likely_origin_confidence": None, "totals": {}, "seasons": []}
+
+            def summary(self):
+                return {"players": 1, "player_seasons": 0, "above_age": 0}
+
+            def search(self, query, limit=1000):
+                return [{"player_id": "1"}]
+
+        with patch("scripts.check_parity.CsvScoutingData", DummyCsvData), patch("dashboard.postgres_source.PostgresScoutingData", DummyPgData):
+            mismatches, sample_size = run_parity_check(data_dir=str(Path(tempfile.mkdtemp())), database_url="postgresql://example", sample_size=1, seed=0)
+            self.assertEqual(mismatches, [])
+            self.assertIsInstance(seen["data_dir"], Path)
+            self.assertEqual(sample_size, 3)
+
+
 class MergeBeforeInsertTests(unittest.TestCase):
     """The importer must insert at most one row per (player, team, season)."""
 
@@ -260,6 +303,136 @@ class MergeBeforeInsertTests(unittest.TestCase):
         # The masked recent row is preferred on stats (a tie here), but the
         # known name from history must still be what gets inserted.
         self.assertEqual(insert_calls[0][1][5], "Real Name")
+
+
+class InsertObservationsTests(unittest.TestCase):
+    """The lossless observation layer (0002 migration) must never lose a source's row.
+
+    ``player_team_seasons`` merges overlapping keys down to one canonical row
+    (see MergeBeforeInsertTests above) -- that is correct for the canonical
+    table, but it is exactly the information ``player_team_season_observations``
+    exists to preserve for the two sources independently. These tests prove
+    ``_insert_observations`` never performs that merge.
+    """
+
+    def _observation_rows(self, cursor):
+        return [
+            params
+            for sql, params in cursor.calls
+            if sql.startswith("INSERT INTO player_team_season_observations")
+        ]
+
+    def test_overlapping_canonical_key_still_produces_one_observation_row_per_source(self):
+        # Same (player_id, team_id, season_id) as MergeBeforeInsertTests above,
+        # where merge_canonical_rows() collapses these two rows into one
+        # canonical player_team_seasons row -- source-specific team_name/
+        # age_group/league_name must not be lost just because the canonical
+        # merge discards one of them.
+        history_row = {
+            "player_id": "151674", "team_id": "5613", "season_id": "16",
+            "player_name": "Real Name", "team_name": "Historical Club Name",
+            "league_name": "Historical League", "age_group": "Youth (history)",
+            "stats_available": "true", "stats_completeness": "full",
+            "games": "14", "goals": "0", "minutes": "560", "starts": "14",
+            "sub_on": "0", "sub_off": "0", "yellow_cards_league_cup": "0",
+            "yellow_cards_toto": "0", "red_cards": "0",
+            "_source_file": "player_history",
+        }
+        season_row = {
+            **history_row,
+            "player_name": "*******", "team_name": "Recent Club Name",
+            "league_name": "Recent League", "age_group": "Youth (recent)",
+            "_source_file": "player_season_stats",
+        }
+        all_rows = [history_row, season_row]
+
+        # The canonical merge still collapses these to one row (unaffected by
+        # this change) ...
+        merged_rows = list(merge_canonical_rows(all_rows).values())
+        self.assertEqual(len(merged_rows), 1)
+
+        # ... but both source observations remain queryable independently.
+        cursor = _FakeCursor()
+        count = _insert_observations(cursor, dataset_id=1, all_rows=all_rows)
+        self.assertEqual(count, 2)
+        rows = self._observation_rows(cursor)
+        self.assertEqual(len(rows), 2)
+
+        by_source = {row[4]: row for row in rows}  # index 4 = source_file
+        self.assertEqual(set(by_source), {"player_history", "player_season_stats"})
+        # team_name (index 6), age_group (index 7), league_name (index 8) each
+        # keep their own source's value rather than the merge winner's.
+        self.assertEqual(by_source["player_history"][6], "Historical Club Name")
+        self.assertEqual(by_source["player_history"][7], "Youth (history)")
+        self.assertEqual(by_source["player_history"][8], "Historical League")
+        self.assertEqual(by_source["player_season_stats"][6], "Recent Club Name")
+        self.assertEqual(by_source["player_season_stats"][7], "Youth (recent)")
+        self.assertEqual(by_source["player_season_stats"][8], "Recent League")
+
+    def test_full_overlap_between_sources_still_inserts_every_raw_row(self):
+        # Structurally the same property the real repository data exhibits:
+        # 49,593 recent-source rows and 194,518 history rows, almost entirely
+        # overlapping on canonical key (49,379 of them), yet
+        # player_team_season_observations must hold all of them, not the
+        # smaller merged count. Reproduced here at a scale a unit test can
+        # run quickly, with every key overlapping (the worst case).
+        history_rows = [
+            {
+                "player_id": f"p{i}", "team_id": "t1", "season_id": "10",
+                "player_name": f"History Name {i}", "team_name": "Club",
+                "league_name": "League", "age_group": "Youth",
+                "stats_available": "true", "stats_completeness": "full",
+                "games": "1", "goals": "0", "minutes": "10", "starts": "1",
+                "sub_on": "0", "sub_off": "0", "yellow_cards_league_cup": "0",
+                "yellow_cards_toto": "0", "red_cards": "0",
+                "_source_file": "player_history",
+            }
+            for i in range(25)
+        ]
+        season_rows = [dict(row, _source_file="player_season_stats") for row in history_rows]
+        all_rows = history_rows + season_rows
+
+        merged_rows = list(merge_canonical_rows(all_rows).values())
+        self.assertEqual(len(merged_rows), 25)  # fully collapsed, one per player
+
+        cursor = _FakeCursor()
+        count = _insert_observations(cursor, dataset_id=1, all_rows=all_rows)
+        self.assertEqual(count, 50)  # nothing merged away at the observation layer
+        self.assertEqual(len(self._observation_rows(cursor)), 50)
+
+    def test_recent_source_missing_stats_columns_are_stored_as_null_not_false(self):
+        # player_season_stats.csv genuinely has no stats_available/stats_source/
+        # stats_completeness columns at all (confirmed against this repository's
+        # own data/player_season_stats.csv header) -- _load_season_source()
+        # therefore hands _insert_observations a row with those keys entirely
+        # absent, not empty-string. A lossless observation must record that as
+        # SQL NULL so _normalise_stat_rows can still infer it correctly at read
+        # time, not silently become stats_available=False/"unavailable".
+        season_row = {
+            "player_id": "p1", "team_id": "t1", "season_id": "10",
+            "player_name": "Name", "team_name": "Club", "league_name": "League",
+            "age_group": "Youth", "games": "5", "goals": "1", "minutes": "300",
+            "starts": "4", "sub_on": "0", "sub_off": "1",
+            "yellow_cards_league_cup": "0", "yellow_cards_toto": "0", "red_cards": "0",
+            "_source_file": "player_season_stats",
+            # stats_available / stats_source / stats_completeness: absent.
+        }
+        cursor = _FakeCursor()
+        _insert_observations(cursor, dataset_id=1, all_rows=[season_row])
+        (row,) = self._observation_rows(cursor)
+        # dataset_id, player_id, team_id, season_id, source_file, player_name,
+        # team_name, age_group, league_name, games..red_cards (9 fields),
+        # stats_available, stats_source, stats_completeness
+        stats_available, stats_source, stats_completeness = row[-3:]
+        self.assertIsNone(stats_available)
+        self.assertIsNone(stats_source)
+        self.assertIsNone(stats_completeness)
+
+    def test_optional_bool_leaves_absent_value_unknown(self):
+        self.assertIsNone(_optional_bool(""))
+        self.assertIsNone(_optional_bool(None))
+        self.assertTrue(_optional_bool("true"))
+        self.assertFalse(_optional_bool("false"))
 
 
 if __name__ == "__main__":

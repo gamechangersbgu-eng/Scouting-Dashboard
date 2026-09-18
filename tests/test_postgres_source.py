@@ -22,7 +22,14 @@ from dashboard.postgres_source import PostgresScoutingData
 
 # Markers must not be substrings of one another's SQL text -- see the two
 # "FROM players" queries below, which differ only by ", image_url".
-PLAYER_SEASON_ROWS_MARKER = "FROM player_team_seasons pts"
+#
+# This marker hits _load_players()'s own raw-cursor catalog query against
+# player_team_season_observations (see dashboard/postgres_source.py's module
+# docstring and the 0002 migration), NOT the pandas-based _SEASON_ROW_SQL
+# used by _read_season_rows() -- that one is mocked out entirely below via
+# mock.patch.object(..., "_read_season_rows", ...), so its own SQL text is
+# never actually executed against these fakes.
+PLAYER_SEASON_ROWS_MARKER = "FROM player_team_season_observations o"
 PLAYER_DETAILS_WITH_IMAGE_MARKER = "birth_year, image_url FROM players"
 PLAYER_BIRTH_YEAR_ONLY_MARKER = "SELECT player_id, birth_year FROM players"
 TEAM_VENUE_MARKER = "FROM teams t"
@@ -149,8 +156,10 @@ class PostgresScoutingDataTests(unittest.TestCase):
     def test_load_players_uses_aggregate_players_over_season_stats_only(self):
         data = self._make()
         self.assertIn("p1", data.players)
-        # The players catalog is built from player_season_stats rows only (like
-        # players_youth.csv is), so it reflects only that source's own name --
+        # The players catalog is built from player_season_stats-source
+        # observations only (like players_youth.csv is -- aggregate_players()
+        # only ever runs over phase2_collect_squads's own output, see
+        # ifa_scraper.run.main), so it reflects only that source's own name --
         # the cross-source known-name recovery happens later, in player().
         self.assertEqual(data.players["p1"]["name_status"], "masked")
 
@@ -160,6 +169,129 @@ class PostgresScoutingDataTests(unittest.TestCase):
         self.assertEqual(player["player_name"], "Yosef Cohen")
         season = next(s for s in player["seasons"] if s["season_id"] == 26)
         self.assertEqual(season["games"], 10)  # still the full-quality recent row's stats
+
+    def test_load_players_catalog_reflects_recent_source_only_not_merged_history(self):
+        # A player_season_stats-only catalog must NOT pick up age_group/league
+        # evidence that exists only in player_history.csv -- doing so was the
+        # exact bug this table split fixes (see the 0002 migration's
+        # docstring): it made historical age groups/leagues bleed into what
+        # is supposed to be the *current* catalog.
+        season_frame = pd.DataFrame(
+            [
+                {
+                    "player_id": "p1", "player_name": "*******", "season_id": 26,
+                    "season": "2024/25", "team_id": "t1", "team_name": "Hapoel Kiryat Gat",
+                    "league_id": "101", "age_group": "נוער", "league_name": "ליגת העל לנוער",
+                    "games": 10, "goals": 2, "minutes": 600, "starts": 8, "sub_on": 1,
+                    "sub_off": 2, "yellow_cards_league_cup": 1, "yellow_cards_toto": 0,
+                    "red_cards": 0, "stats_available": True,
+                    "stats_source": "team_player_statistics", "stats_completeness": "full",
+                }
+            ]
+        )
+        history_frame = pd.DataFrame(
+            [
+                {
+                    "player_id": "p1", "player_name": "Yosef Cohen", "season_id": 25,
+                    "season": "2023/24", "team_id": "t1", "team_name": "Hapoel Kiryat Gat",
+                    "league_id": "101, 102", "age_group": "נערים א", "league_name": "ליגה א, ליגה ב",
+                    "games": 5, "goals": 1, "minutes": 300, "starts": 4, "sub_on": 0,
+                    "sub_off": 1, "yellow_cards_league_cup": 0, "yellow_cards_toto": 0,
+                    "red_cards": 0, "stats_available": True,
+                    "stats_source": "team_player_statistics", "stats_completeness": "full",
+                },
+                {
+                    "player_id": "p2", "player_name": "מסארוה", "season_id": 25,
+                    "season": "2023/24", "team_id": "t2", "team_name": "Maccabi Tel Aviv",
+                    "league_id": "303", "age_group": "נוער", "league_name": "ליגה ב",
+                    "games": 8, "goals": 3, "minutes": 420, "starts": 5, "sub_on": 1,
+                    "sub_off": 0, "yellow_cards_league_cup": 1, "yellow_cards_toto": 0,
+                    "red_cards": 0, "stats_available": True,
+                    "stats_source": "team_player_statistics", "stats_completeness": "full",
+                },
+            ]
+        )
+
+        with mock.patch("dashboard.postgres_source.db.connect") as connect, mock.patch(
+            "dashboard.postgres_source.db.current_dataset_id", return_value=7
+        ), mock.patch.object(
+            PostgresScoutingData,
+            "_read_season_rows",
+            side_effect=lambda source_file: season_frame if source_file == "player_season_stats" else history_frame,
+        ):
+            connect.return_value = _FakeConnection({
+                PLAYER_SEASON_ROWS_MARKER: [
+                    ("p1", "*******", 26, "2024/25", "t1", "Hapoel Kiryat Gat", "נוער", "ליגת העל לנוער", 10, 2, 600, 8, 1, 2, 1, 0, 0),
+                ],
+                PLAYER_DETAILS_WITH_IMAGE_MARKER: [("p1", 2011, ""), ("p2", 2009, "")],
+                PLAYER_BIRTH_YEAR_ONLY_MARKER: [("p1", 2011), ("p2", 2009)],
+                TEAM_VENUE_MARKER: [],
+            })
+            data = PostgresScoutingData(database_url="postgresql://fake/fake")
+
+        # p2 has no player_season_stats-source observation at all, so (like a
+        # player who never appears in players_youth.csv) it is not part of the
+        # catalog -- it cannot be opened through this dashboard, matching
+        # CsvScoutingData._load_history_rows()'s documented behavior.
+        self.assertNotIn("p2", data.players)
+        self.assertIn("נוער", data.players["p1"]["age_groups"])
+        self.assertNotIn("נערים א", data.players["p1"]["age_groups"])
+        self.assertIn("ליגת העל לנוער", data.players["p1"]["leagues"])
+        self.assertNotIn("ליגה א", data.players["p1"]["leagues"])
+
+    def test_search_excludes_players_with_no_recent_source_observation(self):
+        # Mirrors CsvScoutingData: search_index is built from self.players,
+        # which is itself built from player_season_stats-source rows only, so
+        # a player who exists only in player_history.csv is not searchable --
+        # exactly as documented on CsvScoutingData._load_history_rows().
+        season_frame = pd.DataFrame(
+            [
+                {
+                    "player_id": "p1", "player_name": "*******", "season_id": 26,
+                    "season": "2024/25", "team_id": "t1", "team_name": "Hapoel Kiryat Gat",
+                    "league_id": "101", "age_group": "נוער", "league_name": "ליגת העל לנוער",
+                    "games": 10, "goals": 2, "minutes": 600, "starts": 8, "sub_on": 1,
+                    "sub_off": 2, "yellow_cards_league_cup": 1, "yellow_cards_toto": 0,
+                    "red_cards": 0, "stats_available": True,
+                    "stats_source": "team_player_statistics", "stats_completeness": "full",
+                }
+            ]
+        )
+        history_frame = pd.DataFrame(
+            [
+                {
+                    "player_id": "p2", "player_name": "מסארוה", "season_id": 25,
+                    "season": "2023/24", "team_id": "t2", "team_name": "Maccabi Tel Aviv",
+                    "league_id": "303", "age_group": "נוער", "league_name": "ליגה ב",
+                    "games": 8, "goals": 3, "minutes": 420, "starts": 5, "sub_on": 1,
+                    "sub_off": 0, "yellow_cards_league_cup": 1, "yellow_cards_toto": 0,
+                    "red_cards": 0, "stats_available": True,
+                    "stats_source": "team_player_statistics", "stats_completeness": "full",
+                }
+            ]
+        )
+
+        with mock.patch("dashboard.postgres_source.db.connect") as connect, mock.patch(
+            "dashboard.postgres_source.db.current_dataset_id", return_value=7
+        ), mock.patch.object(
+            PostgresScoutingData,
+            "_read_season_rows",
+            side_effect=lambda source_file: season_frame if source_file == "player_season_stats" else history_frame,
+        ):
+            connect.return_value = _FakeConnection(
+                {
+                    PLAYER_SEASON_ROWS_MARKER: [
+                        ("p1", "*******", 26, "2024/25", "t1", "Hapoel Kiryat Gat", "נוער", "ליגת העל לנוער", 10, 2, 600, 8, 1, 2, 1, 0, 0),
+                    ],
+                    PLAYER_DETAILS_WITH_IMAGE_MARKER: [("p1", 2011, ""), ("p2", 2009, "")],
+                    PLAYER_BIRTH_YEAR_ONLY_MARKER: [("p1", 2011), ("p2", 2009)],
+                    TEAM_VENUE_MARKER: [],
+                }
+            )
+            data = PostgresScoutingData(database_url="postgresql://fake/fake")
+
+        ids = {entry["player_id"] for entry in data.search("מסארוה", limit=20)}
+        self.assertNotIn("p2", ids)
 
     def test_load_locations_maps_team_to_its_current_venue(self):
         data = self._make(

@@ -10,6 +10,22 @@ The connection string is read only from the DATABASE_URL environment
 variable -- never from alembic.ini -- so it never needs to be committed.
 Migrations are run by an operator (or a deploy step) with the *publisher*
 database role, never by the web application itself.
+
+DATABASE_URL itself always stays a plain ``postgresql://`` (or legacy
+``postgres://``) URL -- that is the exact string ``ifa_scraper/db.py`` hands
+straight to ``psycopg.connect()``, and it must keep working there unchanged.
+SQLAlchemy, however, defaults an unqualified ``postgresql://`` scheme to the
+psycopg2 dialect, and this project intentionally installs psycopg v3
+(``psycopg[binary]==3.2.10``, see requirements.txt) instead, with no
+psycopg2 installed at all. Left alone, that mismatch makes
+``engine_from_config``/``context.configure`` below try to import psycopg2
+and fail with ``ModuleNotFoundError: No module named 'psycopg2'``.
+``_sqlalchemy_url()`` is the fix: it rewrites only the URL SQLAlchemy sees
+(to ``postgresql+psycopg://``, the explicit psycopg v3 dialect), and only in
+memory here -- DATABASE_URL in the environment is never touched, and this
+value is never routed through ``config.set_main_option()`` (which would
+apply ConfigParser ``%`` interpolation to it), so there is nothing here for a
+literal ``%`` in a password to break.
 """
 
 import os
@@ -41,9 +57,27 @@ def _database_url():
     return url
 
 
+def _sqlalchemy_url(raw_url):
+    """Rewrite a plain postgresql(+legacy postgres):// URL for psycopg v3.
+
+    Pure string transform, no I/O -- kept separate from ``_database_url()``
+    so the two responsibilities (reading DATABASE_URL, adapting it for
+    SQLAlchemy) stay independently testable. Only the scheme changes; a URL
+    that already names a dialect (``postgresql+psycopg://``, or any other
+    ``postgresql+...://``) is returned unchanged rather than rewritten again.
+    """
+    if raw_url.startswith("postgresql+"):
+        return raw_url
+    if raw_url.startswith("postgresql://"):
+        return "postgresql+psycopg://" + raw_url[len("postgresql://"):]
+    if raw_url.startswith("postgres://"):
+        return "postgresql+psycopg://" + raw_url[len("postgres://"):]
+    return raw_url
+
+
 def run_migrations_offline():
     context.configure(
-        url=_database_url(),
+        url=_sqlalchemy_url(_database_url()),
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -54,7 +88,7 @@ def run_migrations_offline():
 
 def run_migrations_online():
     configuration = config.get_section(config.config_ini_section) or {}
-    configuration["sqlalchemy.url"] = _database_url()
+    configuration["sqlalchemy.url"] = _sqlalchemy_url(_database_url())
     connectable = engine_from_config(
         configuration,
         prefix="sqlalchemy.",

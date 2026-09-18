@@ -26,13 +26,22 @@ behavior and IFA's own single-value team-venue data).
 
 ``player_team_seasons`` is one row per (player_id, team_id, season_id) --
 never per source_file, which is provenance only (which CSV source's stats
-won the importer's merge). Which league(s) a (team_id, season_id) played in
-is a separate, normalized fact in ``team_season_leagues`` (one row per
-league, real foreign key to ``leagues``) rather than a column on this table,
-because the source stats themselves are not decomposable per league -- see
-the migration's "Why this grain, and not source_file or league_id" for the
-real data that established this. The season-row queries below reconstruct a
-comma-joined ``league_id`` display string from that join purely so
+won the importer's merge). It is the canonical/merged view and this module
+deliberately does NOT read it for ``_load_season_rows``/``_load_history_rows``/
+``_load_players``: those three need every row each source published,
+including the ones the merge discarded, to reproduce
+``player_season_stats.csv``/``player_history.csv`` faithfully. That full,
+unmerged row population lives in ``player_team_season_observations`` (see
+the 0002 migration) instead -- one row per (player_id, team_id, season_id,
+source_file), written by the importer before it ever merges anything.
+
+Which league(s) a (team_id, season_id) played in is a separate, normalized
+fact in ``team_season_leagues`` (one row per league, real foreign key to
+``leagues``) rather than a column on either fact table, because the source
+stats themselves are not decomposable per league -- see the 0001 migration's
+"Why this grain, and not source_file or league_id" for the real data that
+established this. The season-row queries below reconstruct a comma-joined
+``league_id`` display string from that join purely so
 ``BaseScoutingData.player()``'s existing season-display code (shared with
 the CSV path, which still has a genuine comma-joined ``league_id`` column)
 does not need a Postgres-specific branch.
@@ -49,40 +58,48 @@ from .app_core import BaseScoutingData
 
 log = logging.getLogger(__name__)
 
+# Reads player_team_season_observations, NOT player_team_seasons: the
+# canonical table keeps at most one row per (player, team, season) after the
+# importer's merge, so filtering it by source_file only returns whichever
+# source happened to *win* that merge -- 214 of 49,593 recent rows in this
+# repository's own data, not the CSV's full row population. The observation
+# table records every source's row before any merge happens (see the 0002
+# migration), which is what a faithful CSV-equivalent read path needs. See
+# the 0002 migration's docstring for the full "why".
 _SEASON_ROW_SQL = """
     SELECT
-        pts.player_id,
-        pts.player_name,
-        pts.season_id,
+        o.player_id,
+        o.player_name,
+        o.season_id,
         s.label AS season,
-        pts.team_id,
-        pts.team_name,
+        o.team_id,
+        o.team_name,
         COALESCE(tsl.league_ids, '') AS league_id,
-        pts.age_group,
-        pts.league_name,
-        pts.games,
-        pts.goals,
-        pts.minutes,
-        pts.starts,
-        pts.sub_on,
-        pts.sub_off,
-        pts.yellow_cards_league_cup,
-        pts.yellow_cards_toto,
-        pts.red_cards,
-        pts.stats_available,
-        pts.stats_source,
-        pts.stats_completeness
-    FROM player_team_seasons pts
-    JOIN seasons s ON s.season_id = pts.season_id
+        o.age_group,
+        o.league_name,
+        o.games,
+        o.goals,
+        o.minutes,
+        o.starts,
+        o.sub_on,
+        o.sub_off,
+        o.yellow_cards_league_cup,
+        o.yellow_cards_toto,
+        o.red_cards,
+        o.stats_available,
+        o.stats_source,
+        o.stats_completeness
+    FROM player_team_season_observations o
+    JOIN seasons s ON s.season_id = o.season_id
     LEFT JOIN (
         SELECT dataset_id, team_id, season_id,
                string_agg(league_id::text, ', ' ORDER BY league_id) AS league_ids
         FROM team_season_leagues
         GROUP BY dataset_id, team_id, season_id
-    ) tsl ON tsl.dataset_id = pts.dataset_id
-         AND tsl.team_id = pts.team_id
-         AND tsl.season_id = pts.season_id
-    WHERE pts.dataset_id = %(dataset_id)s AND pts.source_file = %(source_file)s
+    ) tsl ON tsl.dataset_id = o.dataset_id
+         AND tsl.team_id = o.team_id
+         AND tsl.season_id = o.season_id
+    WHERE o.dataset_id = %(dataset_id)s AND o.source_file = %(source_file)s
 """
 
 
@@ -121,25 +138,36 @@ class PostgresScoutingData(BaseScoutingData):
         return frame
 
     def _load_players(self):
-        # Deliberately not routed through _normalise_stat_rows/pandas: aggregate_players()
-        # expects plain Python None/int/str values (it does `row[field] or 0` and calls
-        # .split(", ") on age_group/league_name unconditionally), and pandas' nullable
-        # Int64 dtype uses pd.NA, whose truthiness is ambiguous and would break that
-        # unconditional `or 0`. A raw cursor keeps this the same shape aggregate_players
-        # already expects from the scraper's own season rows.
+        # Reproduce players_youth.csv exactly: it is built by aggregate_players()
+        # over the recent scrape's own season rows only (ifa_scraper.run.main --
+        # phase2_collect_squads output, i.e. player_season_stats.csv), never over
+        # player_history.csv. Aggregating history rows in here too would surface
+        # historical age groups/leagues/current_team as if they were part of the
+        # current catalog -- exactly the parity failures the merged-canonical-rows
+        # version of this method caused (see the 0002 migration's docstring for
+        # the full story); the cross-source known-name recovery that
+        # player_history.csv *does* contribute happens later, in player() itself.
+        #
+        # Deliberately not routed through _normalise_stat_rows/pandas:
+        # aggregate_players() expects plain Python None/int/str values (it does
+        # `row[field] or 0` and calls .split(", ") on age_group/league_name
+        # unconditionally), and pandas' nullable Int64 dtype uses pd.NA, whose
+        # truthiness is ambiguous and would break that unconditional `or 0`. A
+        # raw cursor keeps this the same shape aggregate_players already expects
+        # from the scraper's own season rows.
         with db.connect(self.database_url) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
                     SELECT
-                        pts.player_id, pts.player_name, pts.season_id, s.label,
-                        pts.team_id, pts.team_name, pts.age_group,
-                        pts.league_name, pts.games, pts.goals, pts.minutes, pts.starts,
-                        pts.sub_on, pts.sub_off, pts.yellow_cards_league_cup,
-                        pts.yellow_cards_toto, pts.red_cards
-                    FROM player_team_seasons pts
-                    JOIN seasons s ON s.season_id = pts.season_id
-                    WHERE pts.dataset_id = %s AND pts.source_file = 'player_season_stats'
+                        o.player_id, o.player_name, o.season_id, s.label,
+                        o.team_id, o.team_name, o.age_group,
+                        o.league_name, o.games, o.goals, o.minutes, o.starts,
+                        o.sub_on, o.sub_off, o.yellow_cards_league_cup,
+                        o.yellow_cards_toto, o.red_cards
+                    FROM player_team_season_observations o
+                    JOIN seasons s ON s.season_id = o.season_id
+                    WHERE o.dataset_id = %s AND o.source_file = 'player_season_stats'
                     """,
                     (self.dataset_id,),
                 )
@@ -177,7 +205,9 @@ class PostgresScoutingData(BaseScoutingData):
     def _load_season_rows(self):
         frame = self._read_season_rows("player_season_stats")
         log.info("loaded %s player-season rows (dataset_id=%s)", len(frame), self.dataset_id)
-        return self._normalise_stat_rows(frame, source_name="player_team_seasons(player_season_stats)")
+        return self._normalise_stat_rows(
+            frame, source_name="player_team_season_observations(player_season_stats)"
+        )
 
     def _load_history_rows(self):
         frame = self._read_season_rows("player_history")
@@ -193,7 +223,9 @@ class PostgresScoutingData(BaseScoutingData):
             len(frame),
             self.dataset_id,
         )
-        return self._normalise_stat_rows(frame, source_name="player_team_seasons(player_history)")
+        return self._normalise_stat_rows(
+            frame, source_name="player_team_season_observations(player_history)"
+        )
 
     def _load_locations(self):
         with db.connect(self.database_url) as connection:

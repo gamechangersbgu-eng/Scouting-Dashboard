@@ -55,6 +55,9 @@ def validate_dataset(connection, dataset_id, previous_dataset_id=None):
         _check_no_masked_over_known_regression(cursor, dataset_id, result)
         _check_row_count_drop(cursor, dataset_id, previous_dataset_id, result)
         _check_season_coverage(cursor, dataset_id, previous_dataset_id, result)
+        _check_observation_referential_integrity(cursor, dataset_id, result)
+        _check_every_canonical_row_has_an_observation(cursor, dataset_id, result)
+        _check_observation_row_count_drop(cursor, dataset_id, previous_dataset_id, result)
     return result
 
 
@@ -217,3 +220,126 @@ def _check_season_coverage(cursor, dataset_id, previous_dataset_id, result):
     missing = sorted(set(previous_seasons or []) - set(candidate_seasons or []))
     if missing:
         result.add_error(f"season(s) present in the previous live dataset are missing here: {missing}")
+
+
+def _check_observation_referential_integrity(cursor, dataset_id, result):
+    """Every observation row must reference a real player/team/season, same as _check_referential_integrity.
+
+    ``player_team_season_observations`` (see the 0002 migration) has no
+    database-level FK either, for the same reason ``player_team_seasons``
+    doesn't: the importer upserts dimensions and facts in one transaction and
+    a hard FK would make insertion order matter more than it should.
+    """
+    cursor.execute(
+        """
+        SELECT count(*) FROM player_team_season_observations o
+        WHERE o.dataset_id = %s
+          AND NOT EXISTS (SELECT 1 FROM players p WHERE p.player_id = o.player_id)
+        """,
+        (dataset_id,),
+    )
+    (missing_players,) = cursor.fetchone()
+    if missing_players:
+        result.add_error(
+            f"{missing_players} player_team_season_observations rows reference an unknown player_id"
+        )
+
+    cursor.execute(
+        """
+        SELECT count(*) FROM player_team_season_observations o
+        WHERE o.dataset_id = %s
+          AND NOT EXISTS (SELECT 1 FROM teams t WHERE t.team_id = o.team_id)
+        """,
+        (dataset_id,),
+    )
+    (missing_teams,) = cursor.fetchone()
+    if missing_teams:
+        result.add_error(
+            f"{missing_teams} player_team_season_observations rows reference an unknown team_id"
+        )
+
+    cursor.execute(
+        """
+        SELECT count(*) FROM player_team_season_observations o
+        WHERE o.dataset_id = %s
+          AND NOT EXISTS (SELECT 1 FROM seasons s WHERE s.season_id = o.season_id)
+        """,
+        (dataset_id,),
+    )
+    (missing_seasons,) = cursor.fetchone()
+    if missing_seasons:
+        result.add_error(
+            f"{missing_seasons} player_team_season_observations rows reference an unknown season_id"
+        )
+
+
+def _check_every_canonical_row_has_an_observation(cursor, dataset_id, result):
+    """Every player_team_seasons row must be backed by at least one observation.
+
+    This is the specific invariant the 0002 migration exists to protect: a
+    canonical row is always produced by merging one or two observation rows
+    (see ``scripts.import_canonical_dataset.import_dataset``), so a canonical
+    row with zero matching observations means the two writes -- observations
+    and the canonical merge -- have drifted apart, which is exactly the class
+    of bug that made source-membership unrecoverable before this migration.
+    """
+    cursor.execute(
+        """
+        SELECT count(*) FROM player_team_seasons pts
+        WHERE pts.dataset_id = %s
+          AND NOT EXISTS (
+              SELECT 1 FROM player_team_season_observations o
+              WHERE o.dataset_id = pts.dataset_id
+                AND o.player_id = pts.player_id
+                AND o.team_id = pts.team_id
+                AND o.season_id = pts.season_id
+          )
+        """,
+        (dataset_id,),
+    )
+    (orphaned,) = cursor.fetchone()
+    if orphaned:
+        result.add_error(
+            f"{orphaned} player_team_seasons rows have no matching "
+            f"player_team_season_observations row at all -- the canonical merge "
+            f"and the observation write have drifted apart"
+        )
+
+
+def _check_observation_row_count_drop(cursor, dataset_id, previous_dataset_id, result):
+    """A catastrophic drop in either source's observation count usually means a broken import.
+
+    Mirrors ``_check_row_count_drop`` but per source_file, since the two
+    sources' row counts are independent (see the 0002 migration): a bug that
+    only breaks writing one source's observations -- history and recent stats
+    are written from separate CSVs -- would not necessarily move the combined
+    ``player_team_seasons`` count enough to trip that check alone.
+    """
+    if previous_dataset_id is None:
+        return
+
+    cursor.execute(
+        """
+        SELECT source_file, count(*) FROM player_team_season_observations
+        WHERE dataset_id = %s GROUP BY source_file
+        """,
+        (dataset_id,),
+    )
+    candidate_counts = dict(cursor.fetchall())
+    cursor.execute(
+        """
+        SELECT source_file, count(*) FROM player_team_season_observations
+        WHERE dataset_id = %s GROUP BY source_file
+        """,
+        (previous_dataset_id,),
+    )
+    previous_counts = dict(cursor.fetchall())
+
+    for source_file, previous_count in previous_counts.items():
+        candidate_count = candidate_counts.get(source_file, 0)
+        if previous_count and candidate_count < previous_count * MIN_RETAINED_FRACTION:
+            result.add_error(
+                f"player_team_season_observations rows for source_file={source_file!r} "
+                f"dropped from {previous_count} to {candidate_count} "
+                f"(below {MIN_RETAINED_FRACTION:.0%} of the previous live dataset)"
+            )

@@ -20,6 +20,7 @@ Usage:
 import argparse
 import logging
 import random
+from pathlib import Path
 
 from dashboard.app_core import CsvScoutingData
 
@@ -124,6 +125,7 @@ def run_parity_check(data_dir=None, database_url=None, sample_size=50, seed=0):
     # module itself never requires it.
     from dashboard.postgres_source import PostgresScoutingData
 
+    data_dir = Path(data_dir) if data_dir is not None else None
     csv_data = CsvScoutingData(data_dir)
     pg_data = PostgresScoutingData(database_url)
 
