@@ -1,346 +1,476 @@
-"""Resolve every youth team to a map coordinate.
+"use strict";
 
-The association does not publish a club location, but it does publish each club's home
-grounds and a directory of grounds with street addresses. Chaining the two gives a
-location per team, which is then geocoded. Run after the main scrape:
+// Marker radii in pixels. The earliest club gets the largest pin, so size reads as
+// "how far back in the career this was".
+const PIN_MAX = 30;
+const PIN_MIN = 14;
+const PIN_SINGLE = 22;
 
-    python -m ifa_scraper.venues
-"""
+const el = (id) => document.getElementById(id);
+const num = (value) => (value === null || value === undefined ? "—" : Number(value).toLocaleString("he-IL"));
 
-import argparse
-import csv
-import logging
-import re
-import time
-from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+const state = { players: [], selected: null, map: null, layer: null, primed: false };
 
-import pandas as pd
+function addLocationFilters() {
+  const filters = document.querySelector(".filters");
+  const location = document.createElement("label");
+  location.className = "field select-field";
+  location.innerHTML =
+    '<span class="sr-only">\u05d0\u05d6\u05d5\u05e8 \u05dc\u05d7\u05d9\u05e4\u05d5\u05e9</span>' +
+    '<select id="location"><option value="">\u05db\u05dc \u05d4\u05d0\u05e8\u05e5</option></select>';
 
-from . import config, parse
-from .client import IFAClient
-from .gazetteer import Gazetteer
-from .geocode import Geocoder
+  const radius = document.createElement("label");
+  radius.className = "field select-field";
+  radius.innerHTML =
+    '<span class="sr-only">\u05e8\u05d3\u05d9\u05d5\u05e1 \u05d7\u05d9\u05e4\u05d5\u05e9</span>' +
+    '<select id="radius-km">' +
+    '<option value="10">\u05e2\u05d3 10 \u05e7\"\u05de</option>' +
+    '<option value="25">\u05e2\u05d3 25 \u05e7\"\u05de</option>' +
+    '<option value="50" selected>\u05e2\u05d3 50 \u05e7\"\u05de</option>' +
+    '<option value="100">\u05e2\u05d3 100 \u05e7\"\u05de</option>' +
+    '</select>';
 
-log = logging.getLogger(__name__)
-
-TEAM_FIELD_COLUMNS = ["team_id", "team_name", "field_id", "field_name", "num_fields"]
-LOCATION_COLUMNS = [
-    "team_id",
-    "team_name",
-    "field_id",
-    "field_name",
-    "address",
-    "city",
-    "district",
-    "lat",
-    "lon",
-    "geocode_query",
-    "precision",
-]
-
-# The association files every ground under one of four districts of its own, published
-# as a numeric class on each entry in the grounds directory. That beats inferring a
-# region from coordinates, where the bands overlap: Sharon and central grounds interleave
-# by latitude, and Jerusalem sits at the same latitude as Ashdod.
-FIELD_DISTRICTS = {"1": "צפון", "2": "שרון", "3": "מרכז", "4": "דרום"}
-
-# How a team's coordinates were arrived at, best first.
-PRECISION_STREET = "street"
-PRECISION_LOCALITY = "locality"
-PRECISION_FALLBACK = "fallback"
-PRECISION_NONE = "unresolved"
-
-# Club-name furniture that carries no geographic information. Stripping it leaves the
-# place name, which is what a fallback geocode needs.
-CLUB_PREFIXES = [
-    "מכבי", "הפועל", "הפ'", "בית\"ר", "בני", "עירוני", "מ.ס.", "מ.ס", "א.ס.", "א.ס",
-    "ש.", "צעירי", "אתלטיקו", "ספורטינג", "נערי", "מ.כ.",
-]
-
-# Abbreviations the association uses inside team names, and their full forms.
-NAME_ABBREVIATIONS = {
-    "ת\"א": "תל אביב",
-    "פ\"ת": "פתח תקווה",
-    "י-ם": "ירושלים",
-    "י\"ם": "ירושלים",
-    "ר\"ג": "רמת גן",
-    "ב\"ש": "באר שבע",
-    "ק.": "קרית",
-    "ע.ק.": "קרית",
-    "ע.": "",
-    "כ\"ס": "כפר סבא",
-    "ר\"ל": "ראשון לציון",
-    "ר\"ע": "רמת עמל",
-    "נ\"ע": "נשר עמל",
+  const hint = document.createElement("p");
+  hint.className = "filter-hint";
+  hint.textContent =
+    "\u05d0\u05d6\u05d5\u05e8 \u05d4\u05d7\u05d9\u05e4\u05d5\u05e9 \u05e0\u05de\u05d3\u05d3 \u05de\u05de\u05d2\u05e8\u05e9 \u05d4\u05d1\u05d9\u05ea \u05e9\u05dc \u05d4\u05e7\u05d1\u05d5\u05e6\u05d4 \u05d4\u05e0\u05d5\u05db\u05d7\u05d9\u05ea.";
+  filters.append(location, radius);
+  filters.after(hint);
 }
 
-_QUOTED_NICKNAME_RE = re.compile(r'"[^"]*"|״[^״]*״|\'[^\']*\'')
-_MULTISPACE_RE = re.compile(r"\s+")
-_DIGITS_RE = re.compile(r"\d+")
-_HEBREW_RE = re.compile(r"[\u0590-\u05FF]")
+addLocationFilters();
 
-# Israeli locality names run to about five words ("כוכב יאיר צור יגאל").
-MAX_PLACE_WORDS = 5
+/* ------------------------------ data loading ------------------------------ */
 
+async function getJSON(url) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`${url} -> ${response.status}`);
+  return response.json();
+}
 
-def place_hint(team_name):
-    """Best-effort place name from a team name, for teams whose ground is unknown.
+async function loadSummary() {
+  const summary = await getJSON("/api/summary");
+  const statsText = summary.seasons?.length
+    ? (summary.seasons.length <= 4
+      ? summary.seasons.join(", ")
+      : `${summary.seasons.at(-1)}–${summary.seasons[0]}`)
+    : "—";
+  const historyText = summary.history_seasons?.length
+    ? ` · היסטוריה ${summary.history_seasons.at(-1)}–${summary.history_seasons[0]}`
+    : "";
+  el("dataset").textContent =
+    `${num(summary.players)} שחקנים · ${num(summary.teams_located)}/${num(summary.teams)} קבוצות מאותרות · ` +
+    `${num(summary.above_age)} משחקים מעל הגיל · סטטיסטיקה ${statsText}${historyText}`;
 
-    Team names embed the town ("מכבי ע.ק. אתא"), often abbreviated and sometimes with a
-    sponsor's name attached in quotes. This strips the club furniture and expands
-    abbreviations; it is a fallback only, so being approximate is acceptable.
+  fillSelect(el("birth-year"), summary.birth_years, (year) => `נולדו ${year}`);
+  fillSelect(el("current-team"), summary.current_teams);
+  fillLocations(summary.locations || []);
+}
 
-    The order of the three steps matters. Several club words and abbreviations spell
-    their gershayim as an ASCII quote (בית"ר, ר"ג), so stripping quoted nicknames first
-    would match from that quote and swallow the town name with it.
-    """
-    words = [w for w in (team_name or "").split() if w not in CLUB_PREFIXES]
-    name = " ".join(words)
-    for abbreviation, expansion in NAME_ABBREVIATIONS.items():
-        name = name.replace(abbreviation, f" {expansion} ")
-    name = _QUOTED_NICKNAME_RE.sub(" ", name)
-    return _MULTISPACE_RE.sub(" ", name).strip()
+function fillSelect(select, values, label = (value) => value) {
+  for (const value of values) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label(value);
+    select.append(option);
+  }
+}
 
+function fillLocations(locations) {
+  const select = el("location");
+  for (const location of locations) {
+    const option = document.createElement("option");
+    option.value = location.city;
+    option.textContent = location.city;
+    select.append(option);
+  }
+}
 
-def word_groups(text, from_start=False, max_words=MAX_PLACE_WORDS):
-    """Trailing (or leading) runs of words from a string, longest first.
+async function loadResults() {
+  const params = new URLSearchParams({ q: el("query").value.trim(), limit: "60" });
+  if (el("above-age").checked) params.set("above_age", "1");
+  if (el("birth-year").value) params.set("birth_year", el("birth-year").value);
+  if (el("current-team").value) params.set("current_team", el("current-team").value);
+  if (el("location").value) {
+    params.set("location", el("location").value);
+    params.set("radius_km", el("radius-km").value);
+  }
 
-    Addresses end with their locality and ground names begin with it, so these are the
-    candidate place names to try when the gazetteer has no entry to anchor on.
-    """
-    words = [w for w in _DIGITS_RE.sub(" ", text or "").split() if w]
-    groups = []
-    for size in range(min(max_words, len(words)), 0, -1):
-        groups.append(" ".join(words[:size] if from_start else words[-size:]))
-    return groups
+  state.players = await getJSON(`/api/players?${params}`);
+  renderResults();
 
+  // Open on a real player rather than an empty prompt. Only on the first load, so a
+  // later search never yanks the panel away from whoever is being looked at.
+  if (!state.primed && state.players.length) {
+    state.primed = true;
+    await selectPlayer(state.players[0].player_id);
+  }
+}
 
-def teams_to_locate(*paths):
-    """Every team across the given season files, with the newest season it appears in.
+/* ------------------------------ results list ------------------------------ */
 
-    Both the stats and the club-history files are read, since the older seasons include
-    clubs that have since folded but still belong on a player's map. The team page is
-    season-scoped, so each team is fetched for a season it actually played in.
-    """
-    frames = [
-        pd.read_csv(path, encoding="utf-8-sig", dtype={"team_id": str})[
-            ["team_id", "team_name", "season_id"]
-        ]
-        for path in paths
-        if path.exists()
-    ]
-    if not frames:
-        return []
-    # Grouped by id alone, not by (id, name): clubs get renamed and respelled between
-    # seasons, so grouping on the name too would locate the same club several times.
-    # Sorting first means each club keeps the name from its most recent season.
-    seasons = pd.concat(frames, ignore_index=True).sort_values("season_id")
-    latest = seasons.groupby("team_id", as_index=False).last()
-    return [
-        (row.team_id, row.team_name, int(row.season_id))
-        for row in latest.itertuples(index=False)
-    ]
+function renderResults() {
+  const list = el("results");
+  list.replaceChildren();
 
+  const query = el("query").value.trim();
+  el("results-meta").textContent = state.players.length
+    ? `${state.players.length} תוצאות${query ? "" : " · המובילים בשערים"}`
+    : "";
 
-def load_team_field_checkpoint(path):
-    if not path.exists():
-        return {}
-    with path.open(encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
-        if not set(TEAM_FIELD_COLUMNS).issubset(reader.fieldnames or []):
-            return {}
-        return {row["team_id"]: row for row in reader}
+  if (!state.players.length) {
+    const note = document.createElement("li");
+    note.className = "empty-note";
+    note.textContent = "לא נמצאו שחקנים מתאימים";
+    list.append(note);
+    return;
+  }
 
+  for (const player of state.players) {
+    const item = document.createElement("li");
+    item.dataset.playerId = player.player_id;
+    if (player.player_id === state.selected) item.classList.add("active");
 
-def collect_team_fields(client, teams, checkpoint_path):
-    """Map each team to its home ground, checkpointing as it goes.
+    const name = document.createElement("div");
+    name.className = "result-name";
+    name.append(document.createTextNode(player.player_name));
+    if (player.plays_above_age) {
+      const chip = document.createElement("span");
+      chip.className = "up-chip";
+      chip.textContent = `+${player.age_groups_above} מעל הגיל`;
+      name.append(chip);
+    }
 
-    Team pages are ~190KB and only the grounds block is needed, so the extracted rows
-    are appended to a checkpoint instead of caching the HTML.
-    """
-    known = load_team_field_checkpoint(checkpoint_path)
-    pending = [t for t in teams if t[0] not in known]
-    log.info("team grounds: %s to fetch (%s already known)", len(pending), len(known))
-    if not pending:
-        return known
+    const sub = document.createElement("div");
+    sub.className = "result-sub";
+    const born = player.birth_year ? `נולד ${player.birth_year}` : "שנת לידה לא ידועה";
+    sub.textContent = `${born} · ${player.current_team || "—"} · ${player.goals_total} שערים`;
 
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    item.append(name, sub);
+    item.addEventListener("click", () => selectPlayer(player.player_id));
+    list.append(item);
+  }
+}
 
-    def fetch(team):
-        team_id, team_name, season_id = team
-        page = client.team_page(team_id, season_id)
-        if page is None:
-            return None
-        fields = parse.parse_team_fields(page)
-        field_id, field_name = fields[0] if fields else ("", "")
-        return {
-            "team_id": team_id,
-            "team_name": team_name,
-            "field_id": field_id,
-            "field_name": field_name,
-            "num_fields": len(fields),
-        }
+/* ------------------------------ player view ------------------------------ */
 
-    mode = "a" if known else "w"
-    with checkpoint_path.open(mode, encoding="utf-8-sig", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=TEAM_FIELD_COLUMNS)
-        if not known:
-            writer.writeheader()
-        with ThreadPoolExecutor(config.MAX_WORKERS) as pool:
-            for index, row in enumerate(pool.map(fetch, pending), 1):
-                # Leave failures unrecorded so a later run retries them.
-                if row is not None:
-                    known[row["team_id"]] = row
-                    writer.writerow(row)
-                if index % 50 == 0 or index == len(pending):
-                    handle.flush()
-                    log.info("team grounds: %s/%s", index, len(pending))
-    return known
+async function selectPlayer(playerId) {
+  state.selected = playerId;
+  renderResults();
+  const player = await getJSON(`/api/player/${playerId}`);
+  el("player").hidden = false;
+  renderHeader(player);
+  renderTiles(player);
+  renderSeasons(player);
+  renderMap(player);
+}
 
+function renderHeader(player) {
+  el("player-name").textContent = player.player_name;
 
-def locate_team(gazetteer, geocoder, team_name, mapping, field):
-    """Resolve one team to coordinates, preferring the most reliable source available.
+  const photo = el("player-photo");
+  if (player.image_url) {
+    photo.src = player.image_url;
+    photo.alt = player.player_name;
+    photo.hidden = false;
+  } else {
+    photo.hidden = true;
+    photo.removeAttribute("src");
+  }
 
-    The gazetteer fixes the locality first and everything else is measured against it,
-    so a bad street match can only ever be discarded, never relocate the club.
-    """
-    address = field.get("address", "")
-    field_name = mapping.get("field_name", "")
-    hint = place_hint(team_name)
+  const born = player.birth_year ? `נולד ${player.birth_year}` : "שנת לידה לא ידועה";
+  el("player-meta").textContent =
+    `#${player.player_id} · ${born} · ${player.current_team || "—"} · ` +
+    `${player.num_teams} קבוצות · עונות ${player.seasons_played}`;
 
-    anchor = (
-        gazetteer.match_suffix(address)
-        or gazetteer.match_prefix(field_name)
-        or gazetteer.match_prefix(hint)
-    )
-    if anchor:
-        street = geocoder.refine_to_street(address, anchor)
-        if street:
-            return {
-                "lat": street["lat"],
-                "lon": street["lon"],
-                # Prefer the gazetteer's Hebrew name over Nominatim's, which may come
-                # back in Arabic or as a regional council.
-                "city": anchor["name"],
-                "query": street["query"],
-                "precision": PRECISION_STREET,
-            }
-        return {
-            "lat": anchor["lat"],
-            "lon": anchor["lon"],
-            "city": anchor["name"],
-            "query": anchor["query"],
-            "precision": PRECISION_LOCALITY,
-        }
+  const badges = el("player-badges");
+  badges.replaceChildren();
 
-    # Nothing in the gazetteer matched, so there is no anchor to validate against and
-    # a free-text lookup has to stand on its own. Whole strings rarely resolve ("אלמדרסה
-    # כאוכב אבו אל היגא" is a school plus a village), so word runs are tried too.
-    probes = [
-        address,
-        *word_groups(address),
-        field_name,
-        *word_groups(field_name, from_start=True),
-        hint,
-        *word_groups(hint, from_start=True),
-    ]
-    settlement = geocoder.find_settlement(*dict.fromkeys(p for p in probes if p))
-    if settlement:
-        city = settlement.get("city") or ""
-        # Small places resolve to their regional council, and Arab localities to their
-        # Arabic name. Neither reads well in a Hebrew table, and the query that found
-        # the place is already the association's own Hebrew spelling.
-        if not city or city.startswith("מועצה") or not _HEBREW_RE.search(city):
-            city = settlement["query"]
-        return {
-            "lat": settlement["lat"],
-            "lon": settlement["lon"],
-            "city": city,
-            "query": settlement["query"],
-            "precision": PRECISION_FALLBACK,
-        }
-    return None
+  const ageBadge = document.createElement("span");
+  if (player.plays_above_age) {
+    ageBadge.className = "badge badge-up";
+    ageBadge.textContent = `משחק ${player.age_groups_above} קבוצות גיל מעל גילו`;
+  } else {
+    ageBadge.className = "badge badge-ok";
+    ageBadge.textContent = "משחק בקבוצת הגיל שלו";
+  }
+  badges.append(ageBadge);
 
+  // Present the conservative origin-area estimate directly.  The first registered
+  // club remains available in the API and tooltip as provenance, but is not shown as
+  // a separate headline badge because a club is not the same thing as a hometown.
+  const originBadge = document.createElement("span");
+  if (player.likely_origin_city) {
+    const confidence = player.likely_origin_confidence === "medium" ? "בינוני" : "נמוך";
+    originBadge.className = "badge badge-origin";
+    originBadge.textContent = `אזור מוצא משוער: ${player.likely_origin_city} · ביטחון ${confidence}`;
+    const basis = player.likely_origin_basis || {};
+    const clubs = Array.isArray(basis.clubs) ? basis.clubs.join(" / ") : (player.first_club || "");
+    const season = basis.season || player.first_registered_season || "";
+    const age = Number.isInteger(basis.approx_age) ? `, גיל משוער ${basis.approx_age}` : "";
+    originBadge.title = `הערכה לפי המועדון הראשון הרשום${clubs ? `: ${clubs}` : ""}${season ? ` (${season}${age})` : ""}. אינה כתובת מגורים מאומתת.`;
+  } else if (player.likely_origin_confidence === "ambiguous" && player.likely_origin_candidates?.length) {
+    originBadge.className = "badge badge-origin badge-origin-ambiguous";
+    originBadge.textContent = `אזור מוצא משוער: לא חד-משמעי (${player.likely_origin_candidates.join(" / ")})`;
+    originBadge.title = "בשנת הרישום הראשונה נמצאו מועדונים ביותר מעיר אחת, ולכן לא נבחרה עיר יחידה.";
+  } else {
+    originBadge.className = "badge badge-origin badge-origin-unknown";
+    originBadge.textContent = "אזור מוצא משוער: לא ידוע";
+    const provenance = [player.first_club, player.first_registered_season].filter(Boolean).join(" · ");
+    originBadge.title = provenance
+      ? `נמצא רישום מוקדם (${provenance}), אך עדיין אין מיפוי עיר אמין למועדון.`
+      : "לא נמצאו מספיק נתונים כדי להעריך אזור מוצא.";
+  }
+  badges.append(originBadge);
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--refresh-grounds",
-        action="store_true",
-        help="re-fetch the team-to-ground mapping instead of using the checkpoint",
-    )
-    args = parser.parse_args()
+  for (const group of player.age_groups.split(", ").filter(Boolean)) {
+    const badge = document.createElement("span");
+    badge.className = "badge";
+    badge.textContent = group;
+    badges.append(badge);
+  }
 
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S"
-    )
-    started = time.time()
+  if (player.above_age_history) {
+    const badge = document.createElement("span");
+    badge.className = "badge badge-up";
+    badge.textContent = `היסטוריה: ${player.above_age_history}`;
+    badges.append(badge);
+  }
+}
 
-    client = IFAClient()
-    teams = teams_to_locate(
-        config.DATA_DIR / "player_season_stats.csv",
-        config.DATA_DIR / "player_history.csv",
-    )
-    log.info("%s teams to locate", len(teams))
+function renderTiles(player) {
+  const t = player.totals;
+  const coverage = player.stats_coverage_seasons
+    ? `${player.stats_coverage_seasons} עונות עם סטטיסטיקה${player.stats_coverage_complete ? "" : " · כיסוי חלקי"}`
+    : "אין סטטיסטיקה זמינה";
+  const tiles = [
+    { label: "שערים", value: num(t.goals_total), note: coverage },
+    { label: "משחקים", value: num(t.games_total), note: `פותח ${num(t.starts)} · מחליף ${num(t.sub_on)}` },
+    { label: "דקות משחק", value: num(t.minutes_total), note: `${num(t.avg_minutes_per_game)} בממוצע למשחק` },
+    { label: "כרטיסים צהובים", value: num(t.yellow_cards_total), note: "ליגה, גביע וטוטו" },
+    { label: "כרטיסים אדומים", value: num(t.red_cards), note: "" },
+    { label: "קבוצות", value: num(player.num_teams), note: "בכל העונות" },
+  ];
 
-    checkpoint = config.DATA_DIR / "team_fields.csv"
-    if args.refresh_grounds:
-        checkpoint.unlink(missing_ok=True)
-    team_fields = collect_team_fields(client, teams, checkpoint)
+  const container = el("tiles");
+  container.replaceChildren();
+  for (const tile of tiles) {
+    const box = document.createElement("div");
+    box.className = "tile";
+    const label = document.createElement("div");
+    label.className = "tile-label";
+    label.textContent = tile.label;
+    const value = document.createElement("div");
+    value.className = "tile-value";
+    value.textContent = tile.value;
+    box.append(label, value);
+    if (tile.note) {
+      const note = document.createElement("div");
+      note.className = "tile-note";
+      note.textContent = tile.note;
+      box.append(note);
+    }
+    container.append(box);
+  }
+}
 
-    directory = parse.parse_fields_directory(client.fields_directory())
-    addresses = {field["field_id"]: field for field in directory}
-    log.info("grounds directory: %s entries", len(addresses))
+function renderSeasons(player) {
+  const body = el("seasons-body");
+  body.replaceChildren();
 
-    gazetteer = Gazetteer()
-    geocoder = Geocoder()
-    rows = []
-    for team_id, team_name, _ in teams:
-        mapping = team_fields.get(team_id) or {}
-        field = addresses.get(mapping.get("field_id")) or {}
-        located = locate_team(gazetteer, geocoder, team_name, mapping, field)
-        rows.append(
-            {
-                "team_id": team_id,
-                "team_name": team_name,
-                "field_id": mapping.get("field_id", ""),
-                "field_name": mapping.get("field_name", ""),
-                "address": field.get("address", ""),
-                "city": (located or {}).get("city") or place_hint(team_name),
-                "district": FIELD_DISTRICTS.get(field.get("region"), ""),
-                "lat": located["lat"] if located else "",
-                "lon": located["lon"] if located else "",
-                "geocode_query": located["query"] if located else "",
-                "precision": located["precision"] if located else PRECISION_NONE,
-            }
-        )
-        if len(rows) % 50 == 0:
-            geocoder.save()
-            log.info("geocoded %s/%s teams | %s", len(rows), len(teams), geocoder.stats)
+  for (const season of player.seasons) {
+    const row = document.createElement("tr");
 
-    geocoder.save()
+    const seasonCell = document.createElement("td");
+    seasonCell.className = "season-cell";
+    seasonCell.textContent = season.season;
 
-    out_path = config.DATA_DIR / "team_locations.csv"
-    with out_path.open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=LOCATION_COLUMNS)
-        writer.writeheader()
-        writer.writerows(rows)
+    const teamCell = document.createElement("td");
+    teamCell.className = "team-cell";
+    teamCell.append(document.createTextNode(season.team_name));
+    const league = document.createElement("span");
+    league.className = "league-note";
+    league.textContent = season.league_name;
+    teamCell.append(league);
+    if (!season.has_stats) {
+      const historyOnly = document.createElement("span");
+      historyOnly.className = "league-note history-only";
+      historyOnly.textContent = "רישום היסטורי · לא פורסמה סטטיסטיקה מספרית";
+      teamCell.append(historyOnly);
+    }
 
-    resolved = sum(1 for row in rows if row["lat"] != "")
-    by_precision = Counter(row["precision"] for row in rows)
-    log.info(
-        "done in %.1f min | %s/%s teams located -> %s",
-        (time.time() - started) / 60,
-        resolved,
-        len(rows),
-        out_path,
-    )
-    log.info("precision: %s | geocoder: %s", dict(by_precision), geocoder.stats)
-    unresolved = [row["team_name"] for row in rows if row["lat"] == ""]
-    for name in unresolved:
-        log.warning("unresolved: %s", name)
+    const ageCell = document.createElement("td");
+    ageCell.append(document.createTextNode(season.age_group));
+    if (season.above_age_steps > 0) {
+      const chip = document.createElement("span");
+      chip.className = "up-chip";
+      chip.textContent = `+${season.above_age_steps}`;
+      ageCell.append(document.createTextNode(" "), chip);
+    }
 
+    const cards = document.createElement("td");
+    const yellows = season.yellow_cards_league_cup + season.yellow_cards_toto;
+    if (yellows) {
+      const pill = document.createElement("span");
+      pill.className = "card-pill card-yellow";
+      pill.textContent = yellows;
+      cards.append(pill);
+    }
+    if (season.red_cards) {
+      const pill = document.createElement("span");
+      pill.className = "card-pill card-red";
+      pill.textContent = season.red_cards;
+      cards.append(pill);
+    }
+    if (!yellows && !season.red_cards) cards.textContent = "—";
 
-if __name__ == "__main__":
-    main()
+    row.append(seasonCell, teamCell, ageCell);
+    for (const value of [season.games, season.goals, season.minutes]) {
+      const cell = document.createElement("td");
+      cell.className = "num";
+      cell.textContent = num(value);
+      row.append(cell);
+    }
+    row.append(cards);
+    body.append(row);
+  }
+}
+
+/* --------------------------------- map --------------------------------- */
+
+function pinRadius(order, total) {
+  if (total <= 1) return PIN_SINGLE;
+  return PIN_MAX - (order / (total - 1)) * (PIN_MAX - PIN_MIN);
+}
+
+function pinColour(venue) {
+  if (venue.above_age_steps > 0) return { fill: "#d29922", stroke: "#f0c860" };
+  if (venue.is_current) return { fill: "#3fb950", stroke: "#7ee787" };
+  return { fill: "#58a6ff", stroke: "#a5d6ff" };
+}
+
+function ensureMap() {
+  if (state.map) return state.map;
+  state.map = L.map("map", { scrollWheelZoom: true, zoomControl: true });
+  // Plain OpenStreetMap tiles: no key, no watermark, and place names in Hebrew.
+  // CARTO's free basemaps now burn an "API KEY REQUIRED" watermark into the image.
+  // The dark look comes from a CSS filter on the tile pane instead of the provider.
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+    maxZoom: 19,
+  }).addTo(state.map);
+  state.layer = L.layerGroup().addTo(state.map);
+  return state.map;
+}
+
+function escapeHTML(text) {
+  const box = document.createElement("div");
+  box.textContent = text;
+  return box.innerHTML;
+}
+
+function popupHTML(venue, total) {
+  const lines = [
+    `<b>${escapeHTML(venue.teams.join(" · "))}</b>`,
+    `<span class="popup-meta">מקום ${venue.order + 1} מתוך ${total} · ${escapeHTML(venue.seasons)}</span>`,
+  ];
+  if (venue.has_detailed_stats) {
+    const suffix = venue.stats_complete ? "" : " · לעונות המכוסות בלבד";
+    lines.push(
+      `<span class="popup-meta">${venue.games} מש׳ · ${venue.goals} שערים · ${venue.minutes} דק׳${suffix}</span>`
+    );
+  } else {
+    lines.push('<span class="popup-meta">רישום היסטורי · לא פורסמה סטטיסטיקה מספרית</span>');
+  }
+  const where = [venue.field_name, venue.city].filter(Boolean).map(escapeHTML).join(" · ");
+  if (where) lines.push(`<span class="popup-meta">מגרש: ${where}</span>`);
+  if (venue.above_age_steps > 0) {
+    lines.push(`<span class="popup-up">שיחק כאן ${venue.above_age_steps} קבוצות גיל מעל גילו</span>`);
+  }
+  return lines.join("<br>");
+}
+
+function renderMap(player) {
+  const map = ensureMap();
+  state.layer.clearLayers();
+
+  const venues = player.venues;
+  const total = venues.length;
+
+  // The path is drawn first so pins sit on top of it.
+  if (total > 1) {
+    L.polyline(
+      venues.map((venue) => [venue.lat, venue.lon]),
+      { color: "#8d99a8", weight: 1.5, opacity: 0.6, dashArray: "5,6" }
+    ).addTo(state.layer);
+  }
+
+  for (const venue of venues) {
+    const size = pinRadius(venue.order, total);
+    const colour = pinColour(venue);
+    const marker = L.marker([venue.lat, venue.lon], {
+      icon: L.divIcon({
+        className: "",
+        html:
+          `<div class="pin" style="width:${size}px;height:${size}px;` +
+          `background:${colour.fill};border-color:${colour.stroke};` +
+          `font-size:${Math.max(9, size * 0.42)}px">${venue.order + 1}</div>`,
+        iconSize: [size, size],
+        iconAnchor: [size / 2, size / 2],
+      }),
+      // Earliest places are largest, so keep them behind the smaller recent ones.
+      zIndexOffset: venue.order * 10,
+    });
+    marker.bindPopup(popupHTML(venue, total));
+    marker.bindTooltip(`${venue.order + 1}. ${escapeHTML(venue.teams[0])}`, {
+      direction: "top",
+    });
+    marker.addTo(state.layer);
+  }
+
+  if (total > 1) {
+    map.fitBounds(
+      venues.map((venue) => [venue.lat, venue.lon]),
+      { padding: [40, 40], maxZoom: 13 }
+    );
+  } else if (total === 1) {
+    map.setView([venues[0].lat, venues[0].lon], 12);
+  } else {
+    // Nothing to show: fall back to a view of the whole country.
+    map.setView([31.7, 34.9], 7);
+  }
+  // The panel is hidden until the first player arrives, and it stretches to fill the
+  // column, so Leaflet may have measured the container before it had its real size.
+  setTimeout(() => map.invalidateSize(), 0);
+
+  const missing = player.teams.filter((team) => team.lat === null || team.lon === null);
+  const note = el("unlocated");
+  if (missing.length) {
+    note.hidden = false;
+    note.textContent = `ללא מיקום על המפה: ${missing.map((t) => t.team_name).join(", ")}`;
+  } else {
+    note.hidden = true;
+  }
+}
+
+/* --------------------------------- wiring --------------------------------- */
+
+function debounce(fn, delay) {
+  let handle;
+  return (...args) => {
+    clearTimeout(handle);
+    handle = setTimeout(() => fn(...args), delay);
+  };
+}
+
+const debouncedSearch = debounce(loadResults, 180);
+el("query").addEventListener("input", debouncedSearch);
+el("above-age").addEventListener("change", loadResults);
+el("birth-year").addEventListener("change", loadResults);
+el("current-team").addEventListener("change", loadResults);
+el("location").addEventListener("change", loadResults);
+el("radius-km").addEventListener("change", loadResults);
+
+loadSummary().then(loadResults).catch((error) => {
+  el("dataset").textContent = `שגיאה בטעינת הנתונים: ${error.message}`;
+});

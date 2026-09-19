@@ -1,69 +1,105 @@
-# Historical club seasons
+"""Scrape which club each player turned out for, including kids teams.
 
-The project separates **recent detailed statistics** from **full club history**.
+The main scrape covers three youth seasons in full detail. A scout also wants to see
+where a player came from — ילדים and טרום as well as נערים — so this module walks the
+same league and squad endpoints over every season that still has those tables and keeps
+the statistics exposed by the squad endpoint as well as the registration context.
 
-- `python -m ifa_scraper.run` scrapes the three detailed-stat seasons: 2024/25,
-  2025/26 and 2026/27.
-- `python -m ifa_scraper.history` scrapes player-to-club appearances across the full
-  configured youth/kids history window, currently 2010/11 through 2026/27.
+    python -m ifa_scraper.history
+"""
 
-The historical pass intentionally stores only identity/context fields (player, team,
-season, age bracket and league). It does **not** pretend that old games/goals/minutes are
-available when they were not collected. The dashboard joins the overlapping recent
-history rows to `player_season_stats.csv`, so recent seasons retain their detailed stats
-while older rows display `—` for unavailable statistics.
+import argparse
+import logging
+import time
 
-## Recommended workflow
+from . import config, leagues
+from .client import IFAClient
+from .run import (
+    phase1_collect_teams,
+    phase2_collect_squads,
+    single_run_lock,
+    write_csv,
+    SEASON_COLUMNS,
+)
 
-```bash
-# 1. Detailed current/recent statistics
-python -m ifa_scraper.run
+log = logging.getLogger("ifa_scraper")
 
-# 2. Full youth/kids club history
-python -m ifa_scraper.history
+# ``phase2_collect_squads`` already receives the official per-team-season player
+# statistics.  Persist them here instead of throwing them away, while keeping an
+# explicit availability flag so a historical page that lacks numeric columns is not
+# misrepresented as a row of zeroes.
+HISTORY_COLUMNS = [*SEASON_COLUMNS, "stats_available"]
 
-# 3. Resolve home grounds for current and historical teams
-python -m ifa_scraper.venues
 
-# 4. Reload the dashboard
-python -m dashboard.app
-```
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--seasons",
+        type=int,
+        nargs="+",
+        default=sorted({**config.SEASONS, **config.HISTORY_SEASONS}, reverse=True),
+        help="season ids to scrape (default: current stats seasons plus history seasons)",
+    )
+    parser.add_argument("--no-cache", action="store_true", help="bypass the disk cache")
+    parser.add_argument(
+        "--leagues-from-config",
+        action="store_true",
+        help="use the configured league table instead of discovering each season's",
+    )
+    args = parser.parse_args()
 
-The history scraper discovers the actual youth/kids league index separately for each
-season. This matters because old seasons contain divisions that are no longer present in
-the site's current navigation.
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S"
+    )
 
-Discovery is checkpointed in `data/league_index.csv`, and HTTP responses from the table
-endpoints are cached under `data/cache/`, so subsequent runs do not repeat the expensive
-league-id scan.
+    known_seasons = {**config.SEASONS, **config.HISTORY_SEASONS}
+    seasons = [s for s in args.seasons if s in known_seasons]
+    if not seasons:
+        parser.error(
+            f"no known seasons given; choose from {sorted(known_seasons)}"
+        )
 
-## Configured history seasons
+    started = time.time()
 
-| Season | ID |
-|---|---:|
-| 2026/27 | 28 |
-| 2025/26 | 27 |
-| 2024/25 | 26 |
-| 2023/24 | 25 |
-| 2022/23 | 24 |
-| 2021/22 | 23 |
-| 2020/21 | 22 |
-| 2019/20 | 21 |
-| 2018/19 | 20 |
-| 2017/18 | 19 |
-| 2016/17 | 18 |
-| 2015/16 | 17 |
-| 2014/15 | 16 |
-| 2013/14 | 15 |
-| 2012/13 | 14 |
-| 2011/12 | 13 |
-| 2010/11 | 12 |
+    # The same lock as the main scrape: both hit the same origin, and sharing it keeps
+    # a history run from competing with a stats run for the connection pool.
+    with single_run_lock(config.DATA_DIR / ".scrape.lock"):
+        client = IFAClient(use_cache=not args.no_cache)
 
-The window begins at 2010/11 because the current player dataset includes a small number
-of players born in 2005; this reaches approximately age five for that oldest cohort.
+        log.info(
+            "scraping club history for: %s",
+            ", ".join(known_seasons[s] for s in seasons),
+        )
+        # Discovered per season rather than taken from config: the older seasons ran
+        # second divisions that the site's navigation no longer lists anywhere, and
+        # they hold about a fifth of the appearances in those years.
+        league_index = (
+            None if args.leagues_from_config else leagues.youth_index(client, seasons)
+        )
+        team_seasons, empty_leagues = phase1_collect_teams(client, seasons, league_index)
+        rows = phase2_collect_squads(client, team_seasons)
 
-You can restrict the history run when debugging, for example:
+        # Newest first within each player, so the file reads the way the history panel
+        # displays it.
+        rows.sort(key=lambda r: (r["player_id"], -r["season_id"], r["team_name"]))
+        write_csv(config.DATA_DIR / "player_history.csv", HISTORY_COLUMNS, rows)
 
-```bash
-python -m ifa_scraper.history --seasons 28 27 26 25 24
-```
+    log.info(
+        "done in %.1f min | %s rows, %s players, %s teams, %s team-seasons | requests: %s",
+        (time.time() - started) / 60,
+        len(rows),
+        len({row["player_id"] for row in rows}),
+        len({row["team_id"] for row in rows}),
+        len(team_seasons),
+        client.stats,
+    )
+    if empty_leagues:
+        log.warning("%s league-seasons returned no teams", len(empty_leagues))
+        for league_id, name, season_id in empty_leagues:
+            log.warning(
+                "  empty: %s (%s) season %s", name, league_id, config.season_label(season_id)
+            )
+
+
+if __name__ == "__main__":
+    main()
