@@ -26,6 +26,12 @@ RETRY_BACKOFF = 1.5
 # Per-worker pause between requests, to stay gentle on the origin.
 POLITENESS_DELAY = 0.15
 
+# Player cards are comparatively expensive (~150 KB each) and their birth date
+# and photo rarely change.  A routine refresh fetches only active players whose
+# cached details are missing or older than this many days.
+PLAYER_DETAILS_TTL_DAYS = 30
+PLAYER_DETAILS_CHECKPOINT_BATCH_SIZE = 250
+
 # season_id -> human readable label, ordered newest first.
 SEASONS = {
     28: "2026/27",
@@ -60,6 +66,11 @@ HISTORY_SEASONS = {
 def season_label(season_id):
     """Label for a season id from either the stats seasons or the history seasons."""
     return SEASONS.get(season_id) or HISTORY_SEASONS[season_id]
+
+
+def active_detail_season_ids():
+    """The current and immediately previous detailed-stat seasons."""
+    return tuple(sorted(SEASONS, reverse=True)[:2])
 
 # Youth age brackets from youngest to oldest. Playing "above age" means appearing in a
 # bracket further along this ladder than where most of your birth year plays.

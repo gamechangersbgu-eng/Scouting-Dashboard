@@ -56,7 +56,11 @@ from collections import defaultdict
 from pathlib import Path
 
 from dashboard.app_core import merge_canonical_rows
-from ifa_scraper import config, db, name_quality, validation
+from ifa_scraper import config, db, name_quality
+from scripts.dataset_validation import (
+    set_local_statement_timeout as _set_local_statement_timeout,
+    validate_and_record_dataset as _validate_imported_dataset,
+)
 
 log = logging.getLogger("scripts.import_canonical_dataset")
 
@@ -64,6 +68,34 @@ FACT_COLUMNS = [
     "games", "goals", "minutes", "starts", "sub_on", "sub_off",
     "yellow_cards_league_cup", "yellow_cards_toto", "red_cards",
 ]
+
+# These are the scraper artifacts whose contents are imported into a canonical
+# dataset.  Keeping the list here makes the importer the single source of truth
+# for refresh preflight checks as well as direct imports.
+REQUIRED_SOURCE_FILENAMES = (
+    "player_season_stats.csv",
+    "player_history.csv",
+    "player_details.csv",
+    "team_locations.csv",
+    "team_fields.csv",
+)
+
+
+def required_source_paths(data_dir):
+    data_dir = Path(data_dir)
+    return tuple(data_dir / filename for filename in REQUIRED_SOURCE_FILENAMES)
+
+
+def ensure_required_source_files(data_dir):
+    """Refuse an import when a canonical scraper artifact is missing or empty."""
+    invalid = [
+        path.name for path in required_source_paths(data_dir)
+        if not path.is_file() or path.stat().st_size == 0
+    ]
+    if invalid:
+        raise RuntimeError(
+            "required canonical source files are missing or empty: " + ", ".join(invalid)
+        )
 
 
 def _int_or_none(value):
@@ -160,12 +192,6 @@ def _load_season_source(path, source_file):
         row["_source_row_number"] = raw_index
         rows.append(row)
     return rows
-
-
-def _set_local_statement_timeout(cursor):
-    # Scope this to the importer transaction only; it is reset automatically at
-    # COMMIT/ROLLBACK and does not alter the database-wide statement_timeout.
-    cursor.execute("SET LOCAL statement_timeout = '30min'")
 
 
 def _bulk_insert_many(cursor, sql, rows):
@@ -676,18 +702,7 @@ def import_dataset(database_url=None, data_dir=None, scraper_git_sha=None):
     # Validate in its own connection/transaction, after the build is durably
     # committed, so a failing dataset is still there to inspect afterward.
     with db.connect(database_url) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT dataset_id FROM current_dataset WHERE id")
-            row = cursor.fetchone()
-        previous_dataset_id = row[0] if row else None
-        result = validation.validate_dataset(connection, dataset_id, previous_dataset_id)
-        status = "validated" if result.ok else "failed"
-        notes = "; ".join(result.errors) or None
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "UPDATE dataset_versions SET status = %s, finished_at = now(), notes = %s WHERE dataset_id = %s",
-                (status, notes, dataset_id),
-            )
+        result = _validate_imported_dataset(connection, dataset_id)
         connection.commit()
 
     for warning in result.warnings:

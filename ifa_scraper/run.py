@@ -7,8 +7,10 @@ import os
 import time
 from contextlib import contextmanager
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
+from pathlib import Path
 
 from . import config, leagues, name_quality, parse
 from .client import IFAClient
@@ -49,7 +51,8 @@ PLAYER_COLUMNS = [
     "image_url",
 ]
 
-DETAIL_COLUMNS = ["player_id", "birth_year", "birth_month", "image_url"]
+DETAIL_COLUMNS = ["player_id", "birth_year", "birth_month", "image_url", "details_fetched_at"]
+_DETAIL_REQUIRED_COLUMNS = DETAIL_COLUMNS[:4]
 
 SEASON_COLUMNS = [
     "player_id",
@@ -287,7 +290,7 @@ def age_groups_above(row, details, natural):
 
 
 def load_detail_checkpoint(path):
-    """Read previously scraped player-card fields so reruns skip completed work."""
+    """Read cached player-card fields, including inactive historical players."""
     if not path.exists():
         return {}
     known = {}
@@ -295,7 +298,7 @@ def load_detail_checkpoint(path):
         reader = csv.DictReader(handle)
         # A checkpoint written before a column existed is incomplete, so ignore it
         # and let those players be fetched again.
-        if not set(DETAIL_COLUMNS).issubset(reader.fieldnames or []):
+        if not set(_DETAIL_REQUIRED_COLUMNS).issubset(reader.fieldnames or []):
             return {}
         for row in reader:
             year = row.get("birth_year") or ""
@@ -304,26 +307,122 @@ def load_detail_checkpoint(path):
                 "birth_year": int(year) if year.isdigit() else None,
                 "birth_month": int(month) if month.isdigit() else None,
                 "image_url": row.get("image_url") or None,
+                "details_fetched_at": row.get("details_fetched_at") or None,
             }
     return known
 
 
-def phase4_player_details(client, player_ids, checkpoint_path):
+def detail_refresh_player_ids(season_rows, active_season_ids=None):
+    """Return player IDs observed in the current or previous detailed season."""
+    active_season_ids = set(active_season_ids or config.active_detail_season_ids())
+    return sorted(
+        {
+            row["player_id"]
+            for row in season_rows
+            if row.get("season_id") in active_season_ids and row.get("player_id")
+        }
+    )
+
+
+def _details_are_stale(detail, now, ttl_days):
+    fetched_at = detail.get("details_fetched_at")
+    if not fetched_at:
+        return True
+    try:
+        timestamp = datetime.fromisoformat(fetched_at)
+    except ValueError:
+        return True
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    return timestamp < now - timedelta(days=ttl_days)
+
+
+def _checkpoint_needs_timestamp_migration(path):
+    if not path.exists():
+        return False
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        return "details_fetched_at" not in (csv.DictReader(handle).fieldnames or [])
+
+
+def _rewrite_detail_checkpoint(path, details):
+    """Atomically persist one canonical row per player without losing inactive rows."""
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    with temporary_path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=DETAIL_COLUMNS)
+        writer.writeheader()
+        for player_id in sorted(details):
+            detail = details[player_id]
+            writer.writerow(
+                {
+                    "player_id": player_id,
+                    "birth_year": detail["birth_year"] or "",
+                    "birth_month": detail["birth_month"] or "",
+                    "image_url": detail["image_url"] or "",
+                    "details_fetched_at": detail.get("details_fetched_at") or "",
+                }
+            )
+    os.replace(temporary_path, path)
+
+
+def _migrate_detail_checkpoint_timestamps(path, details):
+    """Timestamp legacy cached rows once so they remain reusable after restart.
+
+    A legacy checkpoint proves the detail was successfully parsed and written,
+    but predates per-row timestamps.  Its modification time is the best durable
+    lower bound we have for that work.  This avoids re-fetching every valid
+    active row merely because the timestamp feature was added later, while
+    leaving all existing explicit timestamps unchanged.
+    """
+    migrated_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
+    for detail in details.values():
+        if not detail.get("details_fetched_at"):
+            detail["details_fetched_at"] = migrated_at
+    _rewrite_detail_checkpoint(path, details)
+    log.info("phase 4: migrated %s cached detail rows to timestamped checkpoint", len(details))
+
+
+def phase4_player_details(
+    client,
+    player_ids,
+    checkpoint_path,
+    ttl_days=None,
+    now=None,
+    checkpoint_batch_size=None,
+):
     """Fetch birth date and photo URL for each player from their player page.
 
-    Player pages are ~150KB and only a few fields are needed, so the extracted values
-    are appended to a small checkpoint file rather than caching the raw HTML.
+    Player pages are ~150KB and are not stored in the HTTP cache.  This CSV is
+    therefore the durable checkpoint: every successful result is merged by
+    player_id and atomically rewritten periodically and on interruption.
     """
     details = load_detail_checkpoint(checkpoint_path)
-    pending = [pid for pid in player_ids if pid not in details]
+    ttl_days = config.PLAYER_DETAILS_TTL_DAYS if ttl_days is None else ttl_days
+    now = now or datetime.now(timezone.utc)
+    checkpoint_batch_size = (
+        config.PLAYER_DETAILS_CHECKPOINT_BATCH_SIZE
+        if checkpoint_batch_size is None
+        else checkpoint_batch_size
+    )
+    if checkpoint_batch_size < 1:
+        raise ValueError("checkpoint_batch_size must be positive")
+
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    if _checkpoint_needs_timestamp_migration(checkpoint_path):
+        _migrate_detail_checkpoint_timestamps(checkpoint_path, details)
+
+    player_ids = list(dict.fromkeys(player_ids))
+    pending = [
+        player_id
+        for player_id in player_ids
+        if player_id not in details or _details_are_stale(details[player_id], now, ttl_days)
+    ]
+    fresh_count = len(player_ids) - len(pending)
     log.info(
-        "phase 4: %s player pages to fetch (%s already known)", len(pending), len(details)
+        "phase 4: %s active players considered; %s fresh details skipped; %s due for refresh; %s cached rows retained",
+        len(player_ids), fresh_count, len(pending), len(details),
     )
     if not pending:
         return details
-
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    write_header = not details
 
     def fetch(player_id):
         page = client.player_page(player_id)
@@ -331,27 +430,54 @@ def phase4_player_details(client, player_ids, checkpoint_path):
             return player_id, None
         return player_id, parse.parse_player_details(page)
 
-    mode = "a" if details else "w"
-    with checkpoint_path.open(mode, encoding="utf-8-sig", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=DETAIL_COLUMNS)
-        if write_header:
-            writer.writeheader()
-        with ThreadPoolExecutor(config.MAX_WORKERS) as pool:
-            for index, (player_id, result) in enumerate(pool.map(fetch, pending), 1):
-                # A failed fetch is left unrecorded so a later run retries it.
-                if result is not None:
-                    details[player_id] = result
-                    writer.writerow(
-                        {
-                            "player_id": player_id,
-                            "birth_year": result["birth_year"] or "",
-                            "birth_month": result["birth_month"] or "",
-                            "image_url": result["image_url"] or "",
-                        }
-                    )
-                if index % 1000 == 0 or index == len(pending):
-                    handle.flush()
-                    log.info("phase 4: %s/%s player pages", index, len(pending))
+    completed = 0
+    received_since_checkpoint = 0
+    pool = ThreadPoolExecutor(config.MAX_WORKERS)
+    futures = {pool.submit(fetch, player_id): player_id for player_id in pending}
+    try:
+        # as_completed is essential here: pool.map yields in submission order,
+        # so one slow early page can otherwise strand later successful pages in
+        # memory until it returns, making Ctrl+C lose useful completed work.
+        for future in as_completed(futures):
+            player_id = futures[future]
+            try:
+                fetched_player_id, result = future.result()
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                log.warning("phase 4: player %s detail fetch failed: %s", player_id, exc)
+                continue
+            if result is None:
+                log.warning("phase 4: player %s detail page was unavailable; will retry later", fetched_player_id)
+                continue
+
+            details[fetched_player_id] = {
+                **result,
+                "details_fetched_at": now.isoformat(),
+            }
+            completed += 1
+            received_since_checkpoint += 1
+            if received_since_checkpoint >= checkpoint_batch_size:
+                _rewrite_detail_checkpoint(checkpoint_path, details)
+                received_since_checkpoint = 0
+                log.info("phase 4: checkpointed %s/%s successful detail pages", completed, len(pending))
+    except KeyboardInterrupt:
+        # Persist everything already received from completed futures, then let
+        # the caller stop the pipeline.  Remaining futures are not treated as
+        # completed and will be selected by player_id on the next run.
+        _rewrite_detail_checkpoint(checkpoint_path, details)
+        log.warning("phase 4 interrupted: checkpointed %s/%s successful detail pages", completed, len(pending))
+        for future in futures:
+            future.cancel()
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        pool.shutdown(wait=True)
+
+    # Final durable flush covers a short final batch and keeps the checkpoint
+    # canonical (one row per player_id) even after repeated refreshes.
+    _rewrite_detail_checkpoint(checkpoint_path, details)
+    log.info("phase 4: checkpointed %s/%s successful detail pages", completed, len(pending))
 
     return details
 
@@ -487,7 +613,7 @@ def write_csv(path, columns, rows):
     log.info("wrote %s rows -> %s", len(rows), path)
 
 
-def main():
+def main(argv=None, data_dir=None):
     parser = argparse.ArgumentParser(description="Scrape IFA youth league player stats.")
     parser.add_argument(
         "--seasons",
@@ -512,7 +638,8 @@ def main():
         action="store_true",
         help="use the configured league table instead of discovering each season's",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    data_dir = Path(data_dir) if data_dir is not None else config.DATA_DIR
 
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S"
@@ -524,7 +651,7 @@ def main():
 
     started = time.time()
 
-    with single_run_lock(config.DATA_DIR / ".scrape.lock"):
+    with single_run_lock(data_dir / ".scrape.lock"):
         client = IFAClient(use_cache=not args.no_cache)
 
         log.info("scraping seasons: %s", ", ".join(config.SEASONS[s] for s in seasons))
@@ -539,15 +666,15 @@ def main():
 
         details = {}
         if not args.skip_player_details:
-            player_ids = sorted({row["player_id"] for row in season_rows})
+            player_ids = detail_refresh_player_ids(season_rows)
             details = phase4_player_details(
-                client, player_ids, config.DATA_DIR / "player_details.csv"
+                client, player_ids, data_dir / "player_details.csv"
             )
 
         players = aggregate_players(season_rows, splits, details)
 
-        write_csv(config.DATA_DIR / "player_season_stats.csv", SEASON_COLUMNS, season_rows)
-        write_csv(config.DATA_DIR / "players_youth.csv", PLAYER_COLUMNS, players)
+        write_csv(data_dir / "player_season_stats.csv", SEASON_COLUMNS, season_rows)
+        write_csv(data_dir / "players_youth.csv", PLAYER_COLUMNS, players)
 
     log.info(
         "done in %.1f min | %s players, %s player-season rows, %s team-seasons | requests: %s",

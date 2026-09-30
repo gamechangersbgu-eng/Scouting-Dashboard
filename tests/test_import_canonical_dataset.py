@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from dashboard.app_core import merge_canonical_rows
+from ifa_scraper.validation import ValidationResult
 from scripts.check_parity import run_parity_check
 from scripts.import_canonical_dataset import (
     _bool_from_csv,
@@ -30,6 +31,7 @@ from scripts.import_canonical_dataset import (
     _upsert_dataset_team_locations,
     _upsert_leagues_and_memberships,
     _upsert_players,
+    _validate_imported_dataset,
 )
 
 
@@ -155,6 +157,34 @@ class _FakeCursor:
         return self.fetchall_result
 
 
+class _ValidationCursor:
+    """Minimal cursor for the post-build validation transaction."""
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    def execute(self, sql, params=None):
+        self.connection.calls.append((" ".join(sql.split()), params))
+
+    def fetchone(self):
+        return self.connection.previous_dataset
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+class _ValidationConnection:
+    def __init__(self, previous_dataset=(41,)):
+        self.previous_dataset = previous_dataset
+        self.calls = []
+
+    def cursor(self):
+        return _ValidationCursor(self)
+
+
 def _leagues_upserted(cursor):
     return {params[0]: params[1] for sql, params in cursor.calls if sql.startswith("INSERT INTO leagues")}
 
@@ -237,6 +267,40 @@ class BulkPlayerUpsertTests(unittest.TestCase):
         self.assertEqual(len(update_calls), 1)
         self.assertEqual(update_calls[0][1][0][2], "p1")
         self.assertEqual(update_calls[0][1][0][0], 2000)
+
+
+class ValidationTransactionTimeoutTests(unittest.TestCase):
+    def test_validation_connection_sets_local_timeout_before_validation(self):
+        """The post-commit connection needs its own transaction-local timeout."""
+        connection = _ValidationConnection(previous_dataset=(41,))
+        expected_result = ValidationResult(ok=True)
+
+        def validate(connection_received, dataset_id, previous_dataset_id):
+            self.assertIs(connection_received, connection)
+            self.assertEqual(dataset_id, 42)
+            self.assertEqual(previous_dataset_id, 41)
+            self.assertEqual(
+                connection.calls[0][0],
+                "SET LOCAL statement_timeout = '30min'",
+            )
+            return expected_result
+
+        with patch(
+            "scripts.dataset_validation.validation.validate_dataset",
+            side_effect=validate,
+        ):
+            result = _validate_imported_dataset(connection, dataset_id=42)
+
+        self.assertIs(result, expected_result)
+        self.assertEqual(
+            connection.calls[1][0],
+            "SELECT status FROM dataset_versions WHERE dataset_id = %s",
+        )
+        self.assertEqual(
+            connection.calls[2][0],
+            "SELECT dataset_id FROM current_dataset WHERE id",
+        )
+        self.assertTrue(connection.calls[3][0].startswith("UPDATE dataset_versions SET status"))
 
 
 class CheckParityPathHandingTests(unittest.TestCase):

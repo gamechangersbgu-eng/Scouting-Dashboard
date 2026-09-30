@@ -14,6 +14,7 @@ import re
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pandas as pd
 
@@ -263,14 +264,15 @@ def locate_team(gazetteer, geocoder, team_name, mapping, field):
     return None
 
 
-def main():
+def main(argv=None, data_dir=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--refresh-grounds",
         action="store_true",
         help="re-fetch the team-to-ground mapping instead of using the checkpoint",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    data_dir = Path(data_dir) if data_dir is not None else config.DATA_DIR
 
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S"
@@ -279,12 +281,12 @@ def main():
 
     client = IFAClient()
     teams = teams_to_locate(
-        config.DATA_DIR / "player_season_stats.csv",
-        config.DATA_DIR / "player_history.csv",
+        data_dir / "player_season_stats.csv",
+        data_dir / "player_history.csv",
     )
     log.info("%s teams to locate", len(teams))
 
-    checkpoint = config.DATA_DIR / "team_fields.csv"
+    checkpoint = data_dir / "team_fields.csv"
     if args.refresh_grounds:
         checkpoint.unlink(missing_ok=True)
     team_fields = collect_team_fields(client, teams, checkpoint)
@@ -321,7 +323,7 @@ def main():
 
     geocoder.save()
 
-    out_path = config.DATA_DIR / "team_locations.csv"
+    out_path = data_dir / "team_locations.csv"
     with out_path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=LOCATION_COLUMNS)
         writer.writeheader()

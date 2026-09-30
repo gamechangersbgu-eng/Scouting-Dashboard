@@ -120,14 +120,20 @@ def compare_search(csv_data, pg_data, queries, mismatches):
             )
 
 
-def run_parity_check(data_dir=None, database_url=None, sample_size=50, seed=0):
+def run_parity_check(data_dir=None, database_url=None, sample_size=50, seed=0, dataset_id=None):
     # Imported lazily: only this entry point needs psycopg, so importing the
     # module itself never requires it.
     from dashboard.postgres_source import PostgresScoutingData
 
     data_dir = Path(data_dir) if data_dir is not None else None
     csv_data = CsvScoutingData(data_dir)
-    pg_data = PostgresScoutingData(database_url)
+    # Preserve the production/default construction path exactly: only admin
+    # validation explicitly opts into reading a non-live candidate dataset.
+    pg_data = (
+        PostgresScoutingData(database_url, dataset_id=dataset_id)
+        if dataset_id is not None
+        else PostgresScoutingData(database_url)
+    )
 
     all_ids = list(csv_data.players.keys())
     rng = random.Random(seed)
@@ -151,10 +157,16 @@ def main():
     parser.add_argument("--data-dir", default=None)
     parser.add_argument("--sample-size", type=int, default=50)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--dataset-id", type=int, default=None)
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-    mismatches, sample_size = run_parity_check(data_dir=args.data_dir, sample_size=args.sample_size, seed=args.seed)
+    mismatches, sample_size = run_parity_check(
+        data_dir=args.data_dir,
+        sample_size=args.sample_size,
+        seed=args.seed,
+        dataset_id=args.dataset_id,
+    )
 
     log.info("compared %s players (including %s)", sample_size, ALWAYS_CHECK_PLAYER_IDS)
     if mismatches:

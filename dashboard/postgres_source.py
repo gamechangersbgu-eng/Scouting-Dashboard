@@ -126,12 +126,15 @@ _SEASON_ROW_SQL = """
 
 
 class PostgresScoutingData(BaseScoutingData):
-    """Loads the canonical view from the currently-published Postgres dataset."""
+    """Loads the canonical view from the live dataset or an explicit admin override."""
 
-    def __init__(self, database_url=None):
+    def __init__(self, database_url=None, dataset_id=None):
         self.database_url = db.resolve_database_url(database_url)
-        with db.connect(self.database_url) as connection:
-            self.dataset_id = db.current_dataset_id(connection)
+        if dataset_id is None:
+            with db.connect(self.database_url) as connection:
+                self.dataset_id = db.current_dataset_id(connection)
+        else:
+            self.dataset_id = dataset_id
         if self.dataset_id is None:
             raise RuntimeError(
                 "no dataset is currently published (current_dataset is empty); "

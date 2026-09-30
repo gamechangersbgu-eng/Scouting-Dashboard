@@ -172,6 +172,29 @@ class PostgresScoutingDataTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "no dataset is currently published"):
                 PostgresScoutingData(database_url="postgresql://fake/fake")
 
+    def test_explicit_dataset_id_does_not_read_or_change_current_dataset(self):
+        # Candidate parity must inspect an imported-but-not-yet-published
+        # dataset without temporarily switching the production singleton.
+        with mock.patch(
+            "dashboard.postgres_source.db.current_dataset_id"
+        ) as current_dataset_id, mock.patch.object(
+            PostgresScoutingData, "_load_players", return_value={}
+        ), mock.patch.object(
+            PostgresScoutingData, "_load_season_rows", return_value=[]
+        ), mock.patch.object(
+            PostgresScoutingData, "_load_history_rows", return_value=[]
+        ), mock.patch.object(
+            PostgresScoutingData, "_load_locations", return_value={}
+        ), mock.patch.object(
+            PostgresScoutingData, "_load_details", return_value={}
+        ):
+            data = PostgresScoutingData(
+                database_url="postgresql://fake/fake", dataset_id=8
+            )
+
+        self.assertEqual(data.dataset_id, 8)
+        current_dataset_id.assert_not_called()
+
     def test_catalog_query_orders_by_source_row_number(self):
         # Smoke check that the ORDER BY survives edits to _load_players()'s
         # raw-cursor query text -- the fakes below never execute real SQL, so

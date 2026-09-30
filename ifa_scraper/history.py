@@ -13,6 +13,7 @@ import argparse
 import csv
 import logging
 import time
+from pathlib import Path
 
 from . import config, leagues
 from .client import IFAClient
@@ -39,7 +40,7 @@ def dashboard_player_ids(path):
         return {row["player_id"] for row in csv.DictReader(handle) if row.get("player_id")}
 
 
-def main():
+def main(argv=None, data_dir=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--seasons",
@@ -59,7 +60,8 @@ def main():
         action="store_true",
         help="use the configured league table instead of discovering each season's",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    data_dir = Path(data_dir) if data_dir is not None else config.DATA_DIR
 
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S"
@@ -76,7 +78,7 @@ def main():
 
     # The same lock as the main scrape: both hit the same origin, and sharing it keeps
     # a history run from competing with a stats run for the connection pool.
-    with single_run_lock(config.DATA_DIR / ".scrape.lock"):
+    with single_run_lock(data_dir / ".scrape.lock"):
         client = IFAClient(use_cache=not args.no_cache)
 
         log.info(
@@ -92,7 +94,7 @@ def main():
         team_seasons, empty_leagues = phase1_collect_teams(client, seasons, league_index)
         rows = phase2_collect_squads(client, team_seasons)
         if not args.all_players:
-            tracked = dashboard_player_ids(config.DATA_DIR / "players_youth.csv")
+            tracked = dashboard_player_ids(data_dir / "players_youth.csv")
             if tracked is None:
                 log.warning("players_youth.csv missing; retaining all historical players")
             else:
@@ -106,7 +108,7 @@ def main():
         # Newest first within each player, so the file reads the way the history panel
         # displays it.
         rows.sort(key=lambda r: (r["player_id"], -r["season_id"], r["team_name"]))
-        write_csv(config.DATA_DIR / "player_history.csv", HISTORY_COLUMNS, rows)
+        write_csv(data_dir / "player_history.csv", HISTORY_COLUMNS, rows)
 
     availability = {"full": 0, "partial": 0, "unavailable": 0}
     sources = {}

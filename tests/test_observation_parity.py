@@ -232,7 +232,10 @@ class ObservationLayerRealDataParityTests(unittest.TestCase):
                 "SELECT player_id, birth_year FROM players": [
                     (pid, year) for pid, year in BIRTH_YEARS.items()
                 ],
-                "FROM teams t": [],
+                # _load_locations() reads dataset_team_locations, not teams/venues,
+                # as of the 0003 migration -- see tests/test_row_order_and_locations.py
+                # for the regression this table exists to fix.
+                "FROM dataset_team_locations": [],
             }
         )
         with mock.patch(
