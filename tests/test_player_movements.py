@@ -133,7 +133,7 @@ class PlayerMovementsTests(unittest.TestCase):
         self.assertNotIn("not-hapoel", former)
         self.assertEqual(len([entry for entry in report["former_players"] if entry["player_id"] == "former-one"]), 1)
 
-    def test_former_hapoel_flag_uses_the_shared_full_timeline(self):
+    def test_former_hapoel_flag_uses_all_observed_memberships(self):
         # The same flag is exposed by both list/search data and player detail.
         search = {entry["player_id"]: entry for entry in self.data.search("")}
         self.assertTrue(search["former-one"]["former_hapoel_player"])
@@ -141,6 +141,7 @@ class PlayerMovementsTests(unittest.TestCase):
         self.assertFalse(search["still-hapoel"]["former_hapoel_player"])
         self.assertFalse(search["returnee"]["former_hapoel_player"])
         self.assertFalse(search["not-hapoel"]["former_hapoel_player"])
+        self.assertFalse(search["ambiguous"]["former_hapoel_player"])
 
         self.assertTrue(self.data.player("former-one")["former_hapoel_player"])
         self.assertFalse(self.data.player("returnee")["former_hapoel_player"])
@@ -149,6 +150,21 @@ class PlayerMovementsTests(unittest.TestCase):
         current_ids = {entry["player_id"] for entry in report["current_players"]}
         self.assertIn("former-multi-hapoel", former_ids)
         self.assertIn("returnee", current_ids)
+
+    def test_initialization_and_movements_only_cache_hapoel_timelines(self):
+        # Building the search index must not materialize a canonical career for
+        # every player merely to determine the EX badge.
+        self.assertEqual(self.data._timeline_cache, {})
+
+        self.data.player_movements()
+
+        # The report only needs canonical timelines for players with at least
+        # one Hapoel membership; unrelated catalog players remain uncached.
+        self.assertEqual(
+            set(self.data._timeline_cache),
+            set(self.data._hapoel_candidate_player_ids),
+        )
+        self.assertNotIn("not-hapoel", self.data._timeline_cache)
 
     def test_current_player_origin_uses_current_spell_and_preserves_multiple_clubs(self):
         report = self.data.player_movements()

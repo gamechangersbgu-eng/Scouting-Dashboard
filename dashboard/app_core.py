@@ -279,15 +279,13 @@ class BaseScoutingData:
         self.natural_brackets = run.natural_age_groups(self.season_rows, self.details)
 
         # Search results need the former-Hapoel marker without issuing a second
-        # request per row.  Derive it once from the same canonical timeline used
-        # by both player detail and the movements report; this is deliberately
-        # not based on players_youth.current_team, which is only a recent-source
-        # catalog field and can miss historical Hapoel memberships.
-        self.former_hapoel_player_ids = frozenset(
-            player_id
-            for player_id in self.players
-            if self._is_former_hapoel_player(player_id)
-        )
+        # request per row.  This intentionally scans source memberships rather
+        # than calling _player_timeline() for the full catalog: canonical
+        # timelines are comparatively large and must remain demand-driven.
+        (
+            self.former_hapoel_player_ids,
+            self._hapoel_candidate_player_ids,
+        ) = self._derive_hapoel_player_ids()
 
         self.search_index = [
             {
@@ -422,24 +420,64 @@ class BaseScoutingData:
         self._timeline_cache[player_id] = timeline
         return timeline
 
-    def _is_former_hapoel_player(self, player_id):
-        """Return whether a player left Hapoel Be'er Sheva in observed data.
+    def _derive_hapoel_player_ids(self):
+        """Return former catalog IDs and all Hapoel-membership candidate IDs.
 
-        A player is former only when they have at least one Hapoel membership
-        and *none* of their memberships in the latest observed season are
-        Hapoel.  Multiple Hapoel youth team IDs are handled by the one shared
-        ``is_hapoel_beer_sheva_team`` classifier; a latest season containing
-        both Hapoel and another club is still current Hapoel, never former.
+        The EX badge needs only three facts per player: whether Hapoel was ever
+        observed, the latest observed season, and whether *any* membership in
+        that season is Hapoel.  It does not need canonical statistics or a
+        copied row dictionary.  This is semantically safe across the overlapping
+        history and recent sources because membership evidence is idempotent:
+        duplicate rows cannot change ``ever_hapoel``, and latest-season Hapoel
+        evidence is combined with OR so a same-season external row cannot turn
+        a current Hapoel player into a former one.
         """
-        timeline = self._player_timeline(player_id)
-        if not timeline or not any(is_hapoel_beer_sheva_team(row) for row in timeline):
-            return False
-        latest_season_id = int(timeline[-1]["season_id"])
-        return not any(
-            is_hapoel_beer_sheva_team(row)
-            for row in timeline
-            if int(row["season_id"]) == latest_season_id
+        state_by_player = {}
+        for source_rows in (self.history_rows, self.season_rows):
+            for row in source_rows:
+                player_id = row["player_id"]
+                season_id = int(row["season_id"])
+                is_hapoel = is_hapoel_beer_sheva_team(row)
+                state = state_by_player.get(player_id)
+                if state is None:
+                    state_by_player[player_id] = (is_hapoel, season_id, is_hapoel)
+                    continue
+
+                ever_hapoel, latest_season_id, latest_season_has_hapoel = state
+                if season_id > latest_season_id:
+                    state_by_player[player_id] = (
+                        ever_hapoel or is_hapoel,
+                        season_id,
+                        is_hapoel,
+                    )
+                elif season_id == latest_season_id:
+                    state_by_player[player_id] = (
+                        ever_hapoel or is_hapoel,
+                        latest_season_id,
+                        latest_season_has_hapoel or is_hapoel,
+                    )
+                elif is_hapoel and not ever_hapoel:
+                    state_by_player[player_id] = (
+                        True,
+                        latest_season_id,
+                        latest_season_has_hapoel,
+                    )
+
+        hapoel_candidate_ids = frozenset(
+            player_id
+            for player_id, (ever_hapoel, _, _) in state_by_player.items()
+            if ever_hapoel
         )
+        former_hapoel_player_ids = frozenset(
+            player_id
+            for player_id, (ever_hapoel, _, latest_season_has_hapoel) in state_by_player.items()
+            if (
+                player_id in self.players
+                and ever_hapoel
+                and not latest_season_has_hapoel
+            )
+        )
+        return former_hapoel_player_ids, hapoel_candidate_ids
 
     @staticmethod
     def _movement_teams(rows):
@@ -492,7 +530,10 @@ class BaseScoutingData:
         former_players = []
         current_players = []
         observed_hapoel_ids = set()
-        player_ids = sorted(set(self.rows_by_player) | set(self.history_by_player))
+        # Only a player with at least one Hapoel membership can appear in this
+        # report.  The candidate set is derived from raw source memberships at
+        # initialization, so non-Hapoel players never need a canonical career.
+        player_ids = sorted(self._hapoel_candidate_player_ids)
 
         for player_id in player_ids:
             timeline = self._player_timeline(player_id)
