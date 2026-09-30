@@ -59,6 +59,49 @@ SEASON_STAT_FIELDS = [
     "red_cards",
 ]
 
+# ``אצלנו`` in the movements report is intentionally not configurable: it is
+# Hapoel Be'er Sheva.  These are the IDs and exact Hebrew display-name variants
+# observed in player_season_stats.csv and player_history.csv at the feature's
+# introduction (2026-09-30).  The IFA has published a different team_id for
+# youth squads, colours, numbered squads and historical records, so choosing a
+# single ID would silently lose club spells.  Conversely, matching every name
+# containing "באר שבע" would incorrectly capture Maccabi, M.S. and Otzma Be'er
+# Sheva.  Keep this deliberately small, evidence-based allow-list up to date if
+# the source publishes a new, verified Hapoel Be'er Sheva form.
+HAPOEL_BEER_SHEVA_TEAM_IDS = frozenset(
+    {
+        "1440", "1443", "1444", "2014", "2085", "2143", "2181", "2294",
+        "2755", "2756", "2938", "6248", "6485", "7327", "7447", "7449",
+    }
+)
+HAPOEL_BEER_SHEVA_TEAM_NAMES = frozenset(
+    {
+        "הפ' באר שבע אדום",
+        'הפועל ב"ש',
+        'הפועל ב"ש "לבן"',
+        'הפועל ב"ש 2',
+        'הפועל ב"ש 3',
+        'הפועל ב"ש אדום',
+        'הפועל ב"ש לבן',
+        "הפועל באר שבע",
+        "הפועל באר שבע 2",
+    }
+)
+
+
+def is_hapoel_beer_sheva_team(row):
+    """Return whether a canonical membership belongs to Hapoel Be'er Sheva.
+
+    Team IDs are the strongest evidence, while the exact-name allow-list keeps
+    the report resilient when the IFA introduces another ID for an already
+    verified published form.  This is purposefully *not* a broad Be'er Sheva
+    substring rule; nearby clubs must never become "our club" in this report.
+    """
+    return (
+        _text(row.get("team_id")) in HAPOEL_BEER_SHEVA_TEAM_IDS
+        or _text(row.get("team_name")).strip() in HAPOEL_BEER_SHEVA_TEAM_NAMES
+    )
+
 
 def _clean(value):
     """Make a pandas value safe for JSON: NaN/NaT become None."""
@@ -224,9 +267,27 @@ class BaseScoutingData:
         for row in self.history_rows:
             self.history_by_player[row["player_id"]].append(row)
 
+        # Career timelines are used by both the player page and the Hapoel
+        # Be'er Sheva movements report.  Cache the one canonical interpretation
+        # per player so the report remains an in-memory operation rather than
+        # rebuilding (or querying) a career for every HTTP request.
+        self._timeline_cache = {}
+        self._player_movements_cache = None
+
         # Recomputed here rather than read from the CSV because players_youth.csv only
         # carries the aggregate flag, while the season table shows a flag per spell.
         self.natural_brackets = run.natural_age_groups(self.season_rows, self.details)
+
+        # Search results need the former-Hapoel marker without issuing a second
+        # request per row.  Derive it once from the same canonical timeline used
+        # by both player detail and the movements report; this is deliberately
+        # not based on players_youth.current_team, which is only a recent-source
+        # catalog field and can miss historical Hapoel memberships.
+        self.former_hapoel_player_ids = frozenset(
+            player_id
+            for player_id in self.players
+            if self._is_former_hapoel_player(player_id)
+        )
 
         self.search_index = [
             {
@@ -239,6 +300,7 @@ class BaseScoutingData:
                 "goals_total": int(p.get("goals_total") or 0),
                 "games_total": int(p.get("games_total") or 0),
                 "minutes_total": int(p.get("minutes_total") or 0),
+                "former_hapoel_player": p["player_id"] in self.former_hapoel_player_ids,
                 "haystack": f"{p['player_name']} {p['player_id']} {_text(p.get('current_team'))}",
             }
             for p in self.players.values()
@@ -339,23 +401,225 @@ class BaseScoutingData:
 
         return [{k: v for k, v in e.items() if k != "haystack"} for e in results[:limit]]
 
+    def _player_timeline(self, player_id):
+        """Return this player's canonical, chronologically ordered memberships.
+
+        This is the single shared timeline used by ``player()`` and the
+        Hapoel Be'er Sheva movement report.  In particular it preserves the
+        existing history/recent overlap semantics from ``merge_canonical_rows``:
+        a source row is never counted as a second club membership merely
+        because it appears in both input files.
+        """
+        cached = self._timeline_cache.get(player_id)
+        if cached is not None:
+            return cached
+        merged = merge_canonical_rows(
+            [*self.history_by_player.get(player_id, []), *self.rows_by_player.get(player_id, [])]
+        )
+        timeline = sorted(
+            merged.values(), key=lambda row: (int(row["season_id"]), _text(row.get("team_name")))
+        )
+        self._timeline_cache[player_id] = timeline
+        return timeline
+
+    def _is_former_hapoel_player(self, player_id):
+        """Return whether a player left Hapoel Be'er Sheva in observed data.
+
+        A player is former only when they have at least one Hapoel membership
+        and *none* of their memberships in the latest observed season are
+        Hapoel.  Multiple Hapoel youth team IDs are handled by the one shared
+        ``is_hapoel_beer_sheva_team`` classifier; a latest season containing
+        both Hapoel and another club is still current Hapoel, never former.
+        """
+        timeline = self._player_timeline(player_id)
+        if not timeline or not any(is_hapoel_beer_sheva_team(row) for row in timeline):
+            return False
+        latest_season_id = int(timeline[-1]["season_id"])
+        return not any(
+            is_hapoel_beer_sheva_team(row)
+            for row in timeline
+            if int(row["season_id"]) == latest_season_id
+        )
+
+    @staticmethod
+    def _movement_teams(rows):
+        """Return a deterministic, de-duplicated public team list for a season."""
+        teams = {
+            (_text(row.get("team_id")), _text(row.get("team_name")))
+            for row in rows
+        }
+        return [
+            {"team_id": team_id, "team_name": team_name}
+            for team_id, team_name in sorted(teams, key=lambda team: (team[1], team[0]))
+        ]
+
+    @staticmethod
+    def _movement_seasons(timeline):
+        """Group an already canonical timeline by season in chronological order."""
+        grouped = defaultdict(list)
+        for row in timeline:
+            grouped[int(row["season_id"])].append(row)
+        return [(season_id, grouped[season_id]) for season_id in sorted(grouped)]
+
+    def _movement_identity(self, player_id, timeline):
+        """Build report identity without constructing the full player-detail view."""
+        catalog = self.players.get(player_id, {})
+        _, observed_name = name_quality.best_name(
+            row.get("player_name") for row in reversed(timeline)
+        )
+        birth_year = _clean(catalog.get("birth_year"))
+        if birth_year is None:
+            birth_year = _clean(self.details.get(player_id, {}).get("birth_year"))
+        return {
+            "player_id": player_id,
+            "player_name": observed_name or _text(catalog.get("player_name")) or player_id,
+            "birth_year": _optional_int(birth_year),
+        }
+
+    def player_movements(self):
+        """Report Hapoel Be'er Sheva arrivals and departures from loaded careers.
+
+        IFA rows are season-level registrations, not dated transfer events.  A
+        same-season Hapoel/external pair is therefore explicitly labelled
+        ``same_season_ambiguous`` instead of inventing an arrival/departure
+        direction.  "Previous club" means the nearest earlier *observed*
+        season outside the current Hapoel spell; missing seasons do not break a
+        spell because historic coverage is incomplete.
+        """
+        if self._player_movements_cache is not None:
+            return self._player_movements_cache
+
+        former_players = []
+        current_players = []
+        observed_hapoel_ids = set()
+        player_ids = sorted(set(self.rows_by_player) | set(self.history_by_player))
+
+        for player_id in player_ids:
+            timeline = self._player_timeline(player_id)
+            if not timeline:
+                continue
+            seasons = self._movement_seasons(timeline)
+            season_info = []
+            for season_id, rows in seasons:
+                hapoel_rows = [row for row in rows if is_hapoel_beer_sheva_team(row)]
+                external_rows = [row for row in rows if not is_hapoel_beer_sheva_team(row)]
+                for row in hapoel_rows:
+                    observed_hapoel_ids.add(_text(row.get("team_id")))
+                season_info.append(
+                    {
+                        "season_id": season_id,
+                        "season": _text(rows[0].get("season")),
+                        "hapoel": hapoel_rows,
+                        "external": external_rows,
+                    }
+                )
+
+            hapoel_seasons = [entry for entry in season_info if entry["hapoel"]]
+            if not hapoel_seasons:
+                continue
+            identity = self._movement_identity(player_id, timeline)
+            latest = season_info[-1]
+
+            if latest["hapoel"]:
+                # Work backwards across observed seasons, rather than assuming
+                # numeric season IDs are contiguous.  A gap in the source is
+                # unknown history, not evidence that a spell ended.
+                spell = []
+                for entry in reversed(season_info):
+                    if not entry["hapoel"]:
+                        break
+                    spell.append(entry)
+                spell.reverse()
+                spell_start = spell[0]
+                ambiguous = any(entry["external"] for entry in spell)
+                previous = season_info[len(season_info) - len(spell) - 1] if len(spell) < len(season_info) else None
+
+                # When an external club appears alongside Hapoel in the current
+                # spell, season-only data cannot establish which came first.
+                # Do not turn that row into a supposed source club.
+                if ambiguous:
+                    status = "same_season_ambiguous"
+                    previous = None
+                elif previous is None:
+                    status = "no_previous_history"
+                else:
+                    status = "known"
+
+                current_players.append(
+                    {
+                        **identity,
+                        "current_season": latest["season"],
+                        "current_season_id": latest["season_id"],
+                        "current_hapoel_teams": self._movement_teams(latest["hapoel"]),
+                        "current_spell_start_season": spell_start["season"],
+                        "current_spell_start_season_id": spell_start["season_id"],
+                        "previous_observed_season": previous["season"] if previous else None,
+                        "previous_observed_season_id": previous["season_id"] if previous else None,
+                        "previous_clubs": self._movement_teams(previous["external"]) if previous else [],
+                        "status": status,
+                    }
+                )
+                continue
+
+            # A former player has Hapoel evidence, is no longer Hapoel in the
+            # latest observed season, and has at least one external membership
+            # there.  All latest external clubs are retained; one is never
+            # picked arbitrarily.
+            if not latest["external"]:
+                continue
+            last_hapoel = hapoel_seasons[-1]
+            status = (
+                "same_season_ambiguous"
+                if last_hapoel["external"]
+                else "known"
+            )
+            former_players.append(
+                {
+                    **identity,
+                    "last_hapoel_season": last_hapoel["season"],
+                    "last_hapoel_season_id": last_hapoel["season_id"],
+                    "last_hapoel_teams": self._movement_teams(last_hapoel["hapoel"]),
+                    "latest_season": latest["season"],
+                    "latest_season_id": latest["season_id"],
+                    "current_clubs": self._movement_teams(latest["external"]),
+                    "status": status,
+                }
+            )
+
+        former_players.sort(
+            key=lambda entry: (-entry["last_hapoel_season_id"], entry["player_name"], entry["player_id"])
+        )
+        current_players.sort(
+            key=lambda entry: (-entry["current_spell_start_season_id"], entry["player_name"], entry["player_id"])
+        )
+        summary = {
+            "former_players": len(former_players),
+            "current_players": len(current_players),
+            "known_previous_club": sum(entry["status"] == "known" for entry in current_players),
+            "no_previous_history": sum(entry["status"] == "no_previous_history" for entry in current_players),
+            "ambiguous": sum(
+                entry["status"] == "same_season_ambiguous"
+                for entry in [*former_players, *current_players]
+            ),
+        }
+        self._player_movements_cache = {
+            "club": {
+                "name": "הפועל באר שבע",
+                "team_ids": sorted(observed_hapoel_ids),
+            },
+            "former_players": former_players,
+            "current_players": current_players,
+            "summary": summary,
+        }
+        return self._player_movements_cache
+
     def player(self, player_id):
         """Return a player's de-duplicated career, preserving unknown statistics."""
         player = self.players.get(player_id)
         if player is None:
             return None
 
-        stats_rows = self.rows_by_player.get(player_id, [])
-        # The detailed recent export is considered the preferred source on a
-        # quality tie, so it is passed second -- merge_canonical_rows() keeps
-        # the later row on a tie, which prevents a stale history snapshot from
-        # shadowing it.
-        merged = merge_canonical_rows([*self.history_by_player.get(player_id, []), *stats_rows])
-
-        rows = sorted(
-            merged.values(),
-            key=lambda r: (int(r["season_id"]), _text(r.get("team_name"))),
-        )
+        rows = self._player_timeline(player_id)
 
         # The catalog entry's own name (``player["player_name"]``) only reflects
         # whatever built that catalog -- the scraper's own recent-season rows for
@@ -420,6 +684,7 @@ class BaseScoutingData:
             "plays_above_age": player.get("plays_above_age") == "Yes",
             "age_groups_above": int(player.get("age_groups_above") or 0),
             "above_age_history": _text(player.get("above_age_history")),
+            "former_hapoel_player": player_id in self.former_hapoel_player_ids,
             "totals": totals,
             "seasons": seasons[::-1],
             "teams": teams,
@@ -892,6 +1157,11 @@ def create_app(data_dir=None, data_source=None):
         if found is None:
             return jsonify({"error": "unknown player_id"}), 404
         return jsonify(found)
+
+    @app.get("/api/player-movements")
+    def player_movements():
+        """Return the fixed Hapoel Be'er Sheva movement report from memory."""
+        return jsonify(data.player_movements())
 
     return app
 

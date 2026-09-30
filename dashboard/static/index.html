@@ -13,6 +13,7 @@
     <header class="brand">
       <h1>סקאוטינג נוער</h1>
       <p class="dataset" id="dataset">טוען נתונים…</p>
+      <button class="movement-nav" id="movements-nav" type="button">מעברי שחקנים</button>
     </header>
 
     <div class="controls">
@@ -52,6 +53,53 @@
   </aside>
 
   <main class="main">
+    <article class="movements" id="movements" hidden aria-live="polite">
+      <header class="movements-head">
+        <div>
+          <h2>מעברי שחקנים</h2>
+          <p>הדוח מתייחס תמיד להפועל באר שבע. הנתונים מתארים חברות בקבוצה לפי עונה, ולא תאריכי העברות.</p>
+        </div>
+      </header>
+      <div class="movement-summary" id="movement-summary"></div>
+      <p class="movement-state" id="movement-state">טוען נתוני מעברים…</p>
+
+      <section class="movement-section" id="former-section" hidden>
+        <div class="panel-head">
+          <div>
+            <h3>שחקנים שהיו בהפועל באר שבע — איפה הם היום?</h3>
+            <p class="hint">הקבוצה האחרונה המופיעה בנתונים, לאחר העונה האחרונה בהפועל באר שבע.</p>
+          </div>
+        </div>
+        <div class="table-scroll">
+          <table class="movement-table">
+            <thead><tr>
+              <th>שחקן</th><th>שנת לידה</th><th>עונה אחרונה בהפועל באר שבע</th>
+              <th>קבוצה בהפועל באר שבע</th><th>קבוצה כיום</th><th>עונה נוכחית</th><th>סטטוס</th>
+            </tr></thead>
+            <tbody id="former-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="movement-section" id="current-section" hidden>
+        <div class="panel-head">
+          <div>
+            <h3>שחקנים בהפועל באר שבע כיום — מאיפה הגיעו?</h3>
+            <p class="hint">"הגיע מ-" פירושו הקבוצה הקודמת שנצפתה לפני רצף ההרשמה הנוכחי בהפועל באר שבע.</p>
+          </div>
+        </div>
+        <div class="table-scroll">
+          <table class="movement-table">
+            <thead><tr>
+              <th>שחקן</th><th>שנת לידה</th><th>קבוצה נוכחית</th><th>בהפועל באר שבע מ-</th>
+              <th>הגיע מ-</th><th>עונה קודמת</th><th>סטטוס</th>
+            </tr></thead>
+            <tbody id="current-body"></tbody>
+          </table>
+        </div>
+      </section>
+    </article>
+
     <article class="player" id="player" hidden>
       <header class="player-head">
         <img class="player-photo" id="player-photo" alt="" hidden>
@@ -103,6 +151,6 @@
 
 <script src="/static/league-filter.js"></script>
 <script src="/static/leaflet.js"></script>
-<script src="/static/app.js?v=career-stats-origin-v3"></script>
+<script src="/static/app.js?v=player-movements-v1"></script>
 </body>
 </html>

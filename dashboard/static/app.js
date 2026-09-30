@@ -9,7 +9,7 @@ const PIN_SINGLE = 22;
 const el = (id) => document.getElementById(id);
 const num = (value) => (value === null || value === undefined ? "—" : Number(value).toLocaleString("he-IL"));
 
-const state = { players: [], selected: null, map: null, layer: null, primed: false };
+const state = { players: [], selected: null, map: null, layer: null, primed: false, movements: null };
 
 function addLogoutButton() {
   const button = document.createElement("button");
@@ -153,6 +153,12 @@ function renderResults() {
       chip.textContent = `+${player.age_groups_above} מעל הגיל`;
       name.append(chip);
     }
+    if (player.former_hapoel_player) {
+      const chip = document.createElement("span");
+      chip.className = "ex-chip";
+      chip.textContent = 'EX הפועל ב"ש';
+      name.append(chip);
+    }
 
     const sub = document.createElement("div");
     sub.className = "result-sub";
@@ -169,6 +175,8 @@ function renderResults() {
 
 async function selectPlayer(playerId) {
   state.selected = playerId;
+  el("movements").hidden = true;
+  el("movements-nav").classList.remove("active");
   renderResults();
   const player = await getJSON(`/api/player/${playerId}`);
   el("player").hidden = false;
@@ -176,6 +184,120 @@ async function selectPlayer(playerId) {
   renderTiles(player);
   renderSeasons(player);
   renderMap(player);
+}
+
+/* --------------------------- player movements --------------------------- */
+
+function movementTeams(teams) {
+  return teams?.map((team) => team.team_name).filter(Boolean).join(" / ") || "—";
+}
+
+function movementStatus(status) {
+  // The source has season-level registrations, so this is deliberately a
+  // warning rather than a guessed transfer direction when clubs overlap.
+  if (status === "same_season_ambiguous") return "מספר קבוצות באותה עונה — סדר המעבר אינו ידוע";
+  if (status === "no_previous_history") return "לא ידוע מהנתונים";
+  return "ידוע מהנתונים";
+}
+
+function movementCell(row, text, className = "") {
+  const cell = document.createElement("td");
+  if (className) cell.className = className;
+  cell.textContent = text ?? "—";
+  row.append(cell);
+}
+
+function movementPlayerCell(row, player) {
+  const cell = document.createElement("td");
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "movement-player";
+  button.textContent = player.player_name;
+  button.title = `פתיחת כרטיס שחקן #${player.player_id}`;
+  button.addEventListener("click", () => selectPlayer(player.player_id));
+  cell.append(button);
+  row.append(cell);
+}
+
+function renderMovementRows(body, players, kind) {
+  body.replaceChildren();
+  for (const player of players) {
+    const row = document.createElement("tr");
+    movementPlayerCell(row, player);
+    movementCell(row, player.birth_year ?? "—", "num");
+    if (kind === "former") {
+      movementCell(row, player.last_hapoel_season);
+      movementCell(row, movementTeams(player.last_hapoel_teams));
+      movementCell(row, movementTeams(player.current_clubs));
+      movementCell(row, player.latest_season);
+    } else {
+      movementCell(row, movementTeams(player.current_hapoel_teams));
+      movementCell(row, player.current_spell_start_season);
+      movementCell(
+        row,
+        player.status === "same_season_ambiguous"
+          ? "לא ניתן לקבוע מהנתונים"
+          : player.status === "no_previous_history"
+            ? "לא ידוע מהנתונים"
+            : movementTeams(player.previous_clubs)
+      );
+      movementCell(row, player.previous_observed_season ?? "—");
+    }
+    movementCell(row, movementStatus(player.status), player.status === "same_season_ambiguous" ? "movement-warning" : "");
+    body.append(row);
+  }
+}
+
+function renderMovements(report) {
+  const summary = report.summary;
+  el("movement-summary").replaceChildren(
+    movementSummaryChip(`${num(summary.former_players)} שחקנים שהיו בהפועל באר שבע`),
+    movementSummaryChip(`${num(summary.current_players)} שחקנים בהפועל באר שבע כיום`),
+    movementSummaryChip(`${num(summary.known_previous_club)} מקור קודם ידוע`),
+    movementSummaryChip(`${num(summary.no_previous_history)} ללא היסטוריה קודמת`),
+    movementSummaryChip(`${num(summary.ambiguous)} מקרים לא חד־משמעיים`)
+  );
+  renderMovementRows(el("former-body"), report.former_players, "former");
+  renderMovementRows(el("current-body"), report.current_players, "current");
+  el("former-section").hidden = !report.former_players.length;
+  el("current-section").hidden = !report.current_players.length;
+  const message = !report.former_players.length && !report.current_players.length
+    ? "לא נמצאו מעברי שחקנים להפועל באר שבע בנתונים הזמינים."
+    : "שימו לב: במקרה של מספר קבוצות באותה עונה, סדר המעבר אינו ידוע.";
+  el("movement-state").textContent = message;
+  el("movement-state").classList.toggle("movement-state-warning", report.summary.ambiguous > 0);
+}
+
+function movementSummaryChip(text) {
+  const chip = document.createElement("span");
+  chip.className = "movement-summary-chip";
+  chip.textContent = text;
+  return chip;
+}
+
+async function showMovements() {
+  // The report is a true toggle.  Its DOM remains intact while hidden, so a
+  // second click restores the exact selected player view without rebuilding
+  // the report or fetching it again.
+  if (!el("movements").hidden) {
+    el("movements").hidden = true;
+    el("movements-nav").classList.remove("active");
+    if (state.selected) el("player").hidden = false;
+    return;
+  }
+  el("player").hidden = true;
+  el("movements").hidden = false;
+  el("movements-nav").classList.add("active");
+  if (state.movements) return;
+  el("movement-state").classList.remove("movement-state-error", "movement-state-warning");
+  el("movement-state").textContent = "טוען נתוני מעברים…";
+  try {
+    state.movements = await getJSON("/api/player-movements");
+    renderMovements(state.movements);
+  } catch (error) {
+    el("movement-state").textContent = `שגיאה בטעינת נתוני המעברים: ${error.message}`;
+    el("movement-state").classList.add("movement-state-error");
+  }
 }
 
 function renderHeader(player) {
@@ -208,6 +330,14 @@ function renderHeader(player) {
     ageBadge.textContent = "משחק בקבוצת הגיל שלו";
   }
   badges.append(ageBadge);
+
+  if (player.former_hapoel_player) {
+    const formerHapoelBadge = document.createElement("span");
+    formerHapoelBadge.className = "badge badge-ex";
+    formerHapoelBadge.textContent = 'EX הפועל ב"ש';
+    formerHapoelBadge.title = "שיחק בעבר בהפועל באר שבע, אך אינו בה בעונה האחרונה שנצפתה";
+    badges.append(formerHapoelBadge);
+  }
 
   const originBadge = document.createElement("span");
   if (player.likely_origin_city) {
@@ -482,6 +612,7 @@ el("birth-year").addEventListener("change", loadResults);
 el("current-team").addEventListener("change", loadResults);
 el("location").addEventListener("change", loadResults);
 el("radius-km").addEventListener("change", loadResults);
+el("movements-nav").addEventListener("click", showMovements);
 
 loadSummary().then(loadResults).catch((error) => {
   el("dataset").textContent = `שגיאה בטעינת הנתונים: ${error.message}`;
