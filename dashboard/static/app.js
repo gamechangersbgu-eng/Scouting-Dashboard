@@ -9,7 +9,12 @@ const PIN_SINGLE = 22;
 const el = (id) => document.getElementById(id);
 const num = (value) => (value === null || value === undefined ? "—" : Number(value).toLocaleString("he-IL"));
 
-const state = { players: [], selected: null, map: null, layer: null, primed: false, movements: null };
+// One shared membership set drives both result-row and detail-header stars.
+// It is loaded in one bounded request, never once per displayed player.
+const state = {
+  players: [], selected: null, map: null, layer: null, primed: false, movements: null,
+  shortlists: [], favoriteIds: new Set(), activeShortlist: null,
+};
 
 function addLogoutButton() {
   const button = document.createElement("button");
@@ -62,8 +67,68 @@ addLogoutButton();
 
 async function getJSON(url) {
   const response = await fetch(url);
-  if (!response.ok) throw new Error(`${url} -> ${response.status}`);
-  return response.json();
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.error || `${url} -> ${response.status}`);
+  return payload;
+}
+
+async function csrfToken() {
+  return (await getJSON("/api/auth/csrf")).csrf_token;
+}
+
+async function apiJSON(url, method, body) {
+  const response = await fetch(url, {
+    method,
+    headers: { "Content-Type": "application/json", "X-CSRF-Token": await csrfToken() },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.error || `${url} -> ${response.status}`);
+  return payload;
+}
+
+async function loadShortlistState(playerId) {
+  const suffix = playerId === undefined ? "" : `?player_id=${encodeURIComponent(playerId)}`;
+  const payload = await getJSON(`/api/shortlists${suffix}`);
+  state.shortlists = payload.shortlists || [];
+  state.favoriteIds = new Set(payload.favorite_player_ids || []);
+  return payload;
+}
+
+function showShortlistError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  // Errors cannot leave an optimistic star silently wrong. The visible alert is
+  // intentionally simple and works without introducing another notification framework.
+  window.alert(`לא ניתן לעדכן רשימה: ${message}`);
+}
+
+function isFavorite(playerId) {
+  return state.favoriteIds.has(String(playerId));
+}
+
+function updateFavoriteControl(button, playerId) {
+  const favorite = isFavorite(playerId);
+  button.textContent = favorite ? "★" : "☆";
+  button.classList.toggle("is-favorite", favorite);
+  button.setAttribute("aria-label", favorite ? "הסרה ממועדפים" : "הוספה למועדפים");
+  button.title = button.getAttribute("aria-label");
+}
+
+async function toggleFavorite(playerId) {
+  playerId = String(playerId);
+  const wasFavorite = isFavorite(playerId);
+  if (wasFavorite) state.favoriteIds.delete(playerId); else state.favoriteIds.add(playerId);
+  renderResults();
+  const headerFavorite = el("header-favorite");
+  if (state.selected === playerId && headerFavorite) updateFavoriteControl(headerFavorite, playerId);
+  try {
+    await apiJSON(`/api/favorites/${encodeURIComponent(playerId)}`, wasFavorite ? "DELETE" : "PUT");
+  } catch (error) {
+    if (wasFavorite) state.favoriteIds.add(playerId); else state.favoriteIds.delete(playerId);
+    renderResults();
+    if (state.selected === playerId && headerFavorite) updateFavoriteControl(headerFavorite, playerId);
+    showShortlistError(error);
+  }
 }
 
 async function loadSummary() {
@@ -165,7 +230,30 @@ function renderResults() {
     const born = player.birth_year ? `נולד ${player.birth_year}` : "שנת לידה לא ידועה";
     sub.textContent = `${born} · ${player.current_team || "—"} · ${player.goals_total} שערים`;
 
-    item.append(name, sub);
+    const actions = document.createElement("div");
+    actions.className = "result-shortlist-actions";
+    const favorite = document.createElement("button");
+    favorite.type = "button";
+    favorite.className = "favorite-button";
+    updateFavoriteControl(favorite, player.player_id);
+    favorite.addEventListener("click", (event) => {
+      event.stopPropagation();
+      toggleFavorite(player.player_id);
+    });
+    const addToList = document.createElement("button");
+    addToList.type = "button";
+    addToList.className = "shortlist-button";
+    addToList.textContent = "הוסף לרשימה";
+    addToList.addEventListener("click", (event) => {
+      event.stopPropagation();
+      openMembershipMenu(player.player_id, addToList);
+    });
+    actions.append(favorite, addToList);
+    const top = document.createElement("div");
+    top.className = "result-top";
+    top.append(name, actions);
+
+    item.append(top, sub);
     item.addEventListener("click", () => selectPlayer(player.player_id));
     list.append(item);
   }
@@ -174,9 +262,11 @@ function renderResults() {
 /* ------------------------------ player view ------------------------------ */
 
 async function selectPlayer(playerId) {
-  state.selected = playerId;
+  state.selected = String(playerId);
   el("movements").hidden = true;
   el("movements-nav").classList.remove("active");
+  el("shortlists").hidden = true;
+  el("shortlists-nav").classList.remove("active");
   renderResults();
   const player = await getJSON(`/api/player/${playerId}`);
   el("player").hidden = false;
@@ -285,6 +375,8 @@ async function showMovements() {
     if (state.selected) el("player").hidden = false;
     return;
   }
+  el("shortlists").hidden = true;
+  el("shortlists-nav").classList.remove("active");
   el("player").hidden = true;
   el("movements").hidden = false;
   el("movements-nav").classList.add("active");
@@ -300,8 +392,219 @@ async function showMovements() {
   }
 }
 
+/* ---------------------------- personal shortlists ---------------------------- */
+
+function closeMembershipMenu() {
+  document.querySelector(".shortlist-popover")?.remove();
+}
+
+async function openMembershipMenu(playerId, anchor) {
+  closeMembershipMenu();
+  try {
+    const payload = await loadShortlistState(playerId);
+    const selectedIds = new Set(payload.member_shortlist_ids || []);
+    const menu = document.createElement("div");
+    menu.className = "shortlist-popover";
+    menu.setAttribute("role", "dialog");
+    const title = document.createElement("p");
+    title.className = "shortlist-popover-title";
+    title.textContent = "שמירה ברשימות";
+    menu.append(title);
+    for (const shortlist of state.shortlists) {
+      const label = document.createElement("label");
+      label.className = "shortlist-option";
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.checked = selectedIds.has(shortlist.id);
+      const text = document.createElement("span");
+      text.textContent = shortlist.name;
+      checkbox.addEventListener("change", async () => {
+        checkbox.disabled = true;
+        const previous = !checkbox.checked;
+        try {
+          if (shortlist.is_default) {
+            await apiJSON(`/api/favorites/${encodeURIComponent(playerId)}`, checkbox.checked ? "PUT" : "DELETE");
+            if (checkbox.checked) state.favoriteIds.add(String(playerId)); else state.favoriteIds.delete(String(playerId));
+            renderResults();
+            if (state.selected === String(playerId)) updateFavoriteControl(el("header-favorite"), playerId);
+          } else {
+            const url = `/api/shortlists/${shortlist.id}/players/${encodeURIComponent(playerId)}`;
+            await apiJSON(url, checkbox.checked ? "POST" : "DELETE");
+          }
+        } catch (error) {
+          checkbox.checked = previous;
+          showShortlistError(error);
+        } finally {
+          checkbox.disabled = false;
+        }
+      });
+      label.append(checkbox, text);
+      menu.append(label);
+    }
+    document.body.append(menu);
+    const box = anchor.getBoundingClientRect();
+    menu.style.top = `${Math.min(window.innerHeight - menu.offsetHeight - 8, box.bottom + 5)}px`;
+    menu.style.left = `${Math.max(8, Math.min(window.innerWidth - menu.offsetWidth - 8, box.left))}px`;
+  } catch (error) {
+    showShortlistError(error);
+  }
+}
+
+function setShortlistsState(message = "", error = false) {
+  el("shortlists-state").textContent = message;
+  el("shortlists-state").classList.toggle("error", error);
+}
+
+function renderShortlistCards() {
+  const cards = el("shortlist-cards");
+  cards.replaceChildren();
+  el("shortlist-players").hidden = true;
+  el("shortlists-back").hidden = true;
+  el("shortlists-title").textContent = "הרשימות שלי";
+  el("shortlists-description").textContent = "רשימות אישיות נשמרות לחשבון שלך גם לאחר רענון נתוני הסקאוטינג.";
+  for (const shortlist of state.shortlists) {
+    const card = document.createElement("section");
+    card.className = "shortlist-card";
+    const heading = document.createElement("h3");
+    heading.textContent = shortlist.is_default ? `★ ${shortlist.name}` : shortlist.name;
+    const count = document.createElement("p");
+    count.className = "shortlist-card-count";
+    count.textContent = `${shortlist.player_count} שחקנים`;
+    const actions = document.createElement("div");
+    actions.className = "shortlist-card-actions";
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "shortlist-card-open";
+    open.textContent = "פתיחה";
+    open.addEventListener("click", () => openShortlist(shortlist.id));
+    actions.append(open);
+    if (!shortlist.is_default) {
+      const rename = document.createElement("button");
+      rename.type = "button";
+      rename.textContent = "שינוי שם";
+      rename.addEventListener("click", () => renameShortlist(shortlist));
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.textContent = "מחיקה";
+      remove.addEventListener("click", () => deleteShortlist(shortlist));
+      actions.append(rename, remove);
+    }
+    card.append(heading, count, actions);
+    cards.append(card);
+  }
+  setShortlistsState(state.shortlists.length ? "" : "עדיין אין רשימות.");
+}
+
+async function showShortlists() {
+  closeMembershipMenu();
+  if (!el("shortlists").hidden && state.activeShortlist === null) {
+    el("shortlists").hidden = true;
+    el("shortlists-nav").classList.remove("active");
+    if (state.selected) el("player").hidden = false;
+    return;
+  }
+  state.activeShortlist = null;
+  el("movements").hidden = true;
+  el("movements-nav").classList.remove("active");
+  el("player").hidden = true;
+  el("shortlists").hidden = false;
+  el("shortlists-nav").classList.add("active");
+  setShortlistsState("טוען רשימות…");
+  try {
+    await loadShortlistState();
+    renderShortlistCards();
+  } catch (error) {
+    setShortlistsState(`שגיאה בטעינת הרשימות: ${error.message}`, true);
+  }
+}
+
+async function openShortlist(shortlistId) {
+  state.activeShortlist = shortlistId;
+  setShortlistsState("טוען שחקנים…");
+  try {
+    const payload = await getJSON(`/api/shortlists/${shortlistId}`);
+    const shortlist = payload.shortlist;
+    const players = el("shortlist-players");
+    el("shortlist-cards").replaceChildren();
+    players.replaceChildren();
+    players.hidden = false;
+    el("shortlists-back").hidden = false;
+    el("shortlists-title").textContent = shortlist.is_default ? `★ ${shortlist.name}` : shortlist.name;
+    el("shortlists-description").textContent = `${payload.players.length} שחקנים ברשימה`;
+    setShortlistsState("");
+    if (!payload.players.length) setShortlistsState("אין עדיין שחקנים ברשימה.");
+    for (const player of payload.players) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "shortlist-player";
+      const name = document.createElement("div");
+      name.className = "shortlist-player-name";
+      name.textContent = player.player_name;
+      const meta = document.createElement("div");
+      meta.className = "shortlist-player-meta";
+      const birth = player.birth_year ? `נולד ${player.birth_year}` : "שנת לידה לא ידועה";
+      const team = player.available_in_current_catalog ? (player.current_team || "—") : (player.last_known_team || "—");
+      meta.textContent = `${birth} · ${team}`;
+      button.append(name, meta);
+      if (player.plays_above_age) {
+        const badge = document.createElement("span");
+        badge.className = "up-chip";
+        badge.textContent = `+${player.age_groups_above} מעל הגיל`;
+        button.append(badge);
+      }
+      if (player.former_hapoel_player) {
+        const badge = document.createElement("span");
+        badge.className = "ex-chip";
+        badge.textContent = 'EX הפועל ב"ש';
+        button.append(badge);
+      }
+      if (!player.available_in_current_catalog) {
+        const missing = document.createElement("div");
+        missing.className = "shortlist-missing";
+        missing.textContent = "לא נמצא בקטלוג הנוכחי · מוצג מידע שנשמר בעת ההוספה";
+        button.append(missing);
+      } else {
+        button.addEventListener("click", () => selectPlayer(player.player_id));
+      }
+      players.append(button);
+    }
+  } catch (error) {
+    setShortlistsState(`שגיאה בטעינת הרשימה: ${error.message}`, true);
+  }
+}
+
+async function createShortlist() {
+  const name = window.prompt("שם הרשימה החדשה:");
+  if (name === null) return;
+  try {
+    await apiJSON("/api/shortlists", "POST", { name });
+    await loadShortlistState();
+    renderShortlistCards();
+  } catch (error) { showShortlistError(error); }
+}
+
+async function renameShortlist(shortlist) {
+  const name = window.prompt("שם הרשימה:", shortlist.name);
+  if (name === null) return;
+  try {
+    await apiJSON(`/api/shortlists/${shortlist.id}`, "PATCH", { name });
+    await loadShortlistState();
+    renderShortlistCards();
+  } catch (error) { showShortlistError(error); }
+}
+
+async function deleteShortlist(shortlist) {
+  if (!window.confirm(`למחוק את הרשימה „${shortlist.name}”? השחקנים עצמם לא יימחקו.`)) return;
+  try {
+    await apiJSON(`/api/shortlists/${shortlist.id}`, "DELETE");
+    await loadShortlistState();
+    renderShortlistCards();
+  } catch (error) { showShortlistError(error); }
+}
+
 function renderHeader(player) {
   el("player-name").textContent = player.player_name;
+  updateFavoriteControl(el("header-favorite"), player.player_id);
 
   const photo = el("player-photo");
   if (player.image_url) {
@@ -613,7 +916,24 @@ el("current-team").addEventListener("change", loadResults);
 el("location").addEventListener("change", loadResults);
 el("radius-km").addEventListener("change", loadResults);
 el("movements-nav").addEventListener("click", showMovements);
+el("shortlists-nav").addEventListener("click", showShortlists);
+el("new-shortlist").addEventListener("click", createShortlist);
+el("shortlists-back").addEventListener("click", async () => {
+  state.activeShortlist = null;
+  await loadShortlistState();
+  renderShortlistCards();
+});
+el("header-favorite").addEventListener("click", () => {
+  if (state.selected) toggleFavorite(state.selected);
+});
+el("header-add-shortlist").addEventListener("click", (event) => {
+  if (state.selected) openMembershipMenu(state.selected, event.currentTarget);
+});
+document.addEventListener("click", (event) => {
+  const menu = document.querySelector(".shortlist-popover");
+  if (menu && !menu.contains(event.target) && !event.target.closest(".shortlist-button")) closeMembershipMenu();
+});
 
-loadSummary().then(loadResults).catch((error) => {
+Promise.all([loadSummary(), loadShortlistState()]).then(loadResults).catch((error) => {
   el("dataset").textContent = `שגיאה בטעינת הנתונים: ${error.message}`;
 });

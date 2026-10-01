@@ -1167,6 +1167,10 @@ def create_app(data_dir=None, data_source=None):
     # rejects them, so a leak should fail loudly here rather than in the page.
     app.json.allow_nan = False
     data = _resolve_data_source(data_dir, data_source)
+    # Extension rather than a module global: authenticated application-state
+    # routes can validate a player against this same loaded catalog, while test
+    # factories and simultaneous app instances remain isolated.
+    app.extensions["scouting_data"] = data
 
     @app.get("/")
     def index():

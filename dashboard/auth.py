@@ -207,6 +207,11 @@ def _valid_csrf(value):
     return bool(expected and value and secrets.compare_digest(expected, value))
 
 
+def valid_csrf(value):
+    """Public CSRF check for authenticated JSON routes in sibling modules."""
+    return _valid_csrf(value)
+
+
 def _safe_next(value):
     if not value:
         return None

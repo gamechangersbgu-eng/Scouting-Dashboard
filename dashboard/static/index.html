@@ -13,6 +13,7 @@
     <header class="brand">
       <h1>סקאוטינג נוער</h1>
       <p class="dataset" id="dataset">טוען נתונים…</p>
+      <button class="shortlists-nav" id="shortlists-nav" type="button">הרשימות שלי</button>
       <button class="movement-nav" id="movements-nav" type="button">מעברי שחקנים</button>
     </header>
 
@@ -100,6 +101,22 @@
       </section>
     </article>
 
+    <article class="shortlists" id="shortlists" hidden aria-live="polite">
+      <header class="shortlists-head">
+        <div>
+          <h2 id="shortlists-title">הרשימות שלי</h2>
+          <p id="shortlists-description">רשימות אישיות נשמרות לחשבון שלך גם לאחר רענון נתוני הסקאוטינג.</p>
+        </div>
+        <div class="shortlists-actions">
+          <button id="shortlists-back" type="button" hidden>חזרה לרשימות</button>
+          <button class="primary-action" id="new-shortlist" type="button">+ רשימה חדשה</button>
+        </div>
+      </header>
+      <p class="shortlists-state" id="shortlists-state"></p>
+      <div class="shortlist-cards" id="shortlist-cards"></div>
+      <div class="shortlist-players" id="shortlist-players" hidden></div>
+    </article>
+
     <article class="player" id="player" hidden>
       <header class="player-head">
         <img class="player-photo" id="player-photo" alt="" hidden>
@@ -107,6 +124,10 @@
           <h2 id="player-name"></h2>
           <p class="player-meta" id="player-meta"></p>
           <div class="badges" id="player-badges"></div>
+        </div>
+        <div class="player-shortlist-actions">
+          <button class="favorite-button" id="header-favorite" type="button" aria-label="הוספה למועדפים"></button>
+          <button class="shortlist-button" id="header-add-shortlist" type="button">הוסף לרשימה</button>
         </div>
       </header>
 
@@ -151,6 +172,6 @@
 
 <script src="/static/league-filter.js"></script>
 <script src="/static/leaflet.js"></script>
-<script src="/static/app.js?v=player-movements-v1"></script>
+<script src="/static/app.js?v=user-shortlists-v1"></script>
 </body>
 </html>

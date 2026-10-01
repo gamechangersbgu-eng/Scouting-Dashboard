@@ -47,11 +47,20 @@ the web service filesystem.
 
 1. Keep this repository private, create a Supabase database, and set `DATABASE_URL` in
    your shell. Use the Supabase connection pooler URL for an external host such as Render.
-2. Create the schema:
+2. Create the user schema, then apply every Alembic migration (including the
+   private shortlists tables):
 
    ```bash
    python -m dashboard.manage_users migrate
+   alembic upgrade head
    ```
+
+   `render.yaml` does **not** run Alembic automatically. Before releasing a
+   build that uses a new migration, run the two commands above once from a
+   trusted release shell with the production `DATABASE_URL` set (for example,
+   a Render Shell or an operator machine using the same connection string).
+   Do this before or during the release; it is additive and does not require
+   dropping existing users or canonical scouting tables.
 
 3. Create a UTF-8 CSV outside the repository with the exact headers `username,password`.
    Passwords must be at least 12 characters. Review the change first, then synchronise:
@@ -72,6 +81,21 @@ the web service filesystem.
 
 Render's free web services spin down after idle time and do not retain local writes, which
 is why SQLite and local user files are not used for authentication.
+
+### Personal shortlists
+
+Every authenticated coach has a protected **מועדפים** (Favorites) list plus
+private custom lists. This is PostgreSQL application state, not scraped
+scouting data: it is never copied into a dataset version and is unaffected by
+dataset refresh, publish, or rollback. The browser never sends an owner ID;
+every shortlist read or mutation is scoped to the authenticated session user.
+
+Favorites is created safely on first use and can be toggled with one star.
+The dashboard fetches the signed-in coach's favorite IDs in one bounded
+shortlist request, rather than one request per search result. A membership
+also records a last-known identity snapshot. If a later catalog refresh no
+longer contains a saved player, the shortlist keeps that player visible as
+last-known information rather than inventing current team or statistics.
 
 Responses are cached under `data/cache/`, so an interrupted run resumes almost instantly.
 Delete that directory to force a refresh. Player pages are the exception: they are ~150KB
