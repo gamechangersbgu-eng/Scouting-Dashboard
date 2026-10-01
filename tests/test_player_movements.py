@@ -70,6 +70,9 @@ class PlayerMovementsTests(unittest.TestCase):
             membership("former-multi-hapoel", 23, "haifa", "מכבי חיפה"),
             membership("still-hapoel", 20, "haifa", "מכבי חיפה"),
             membership("still-hapoel", 21, "1443", "הפועל באר שבע"),
+            # The published youth-team name is still Hapoel Be'er Sheva.
+            membership("three-youth", 20, "haifa", "מכבי חיפה"),
+            membership("three-youth", 21, "2373", 'הפ\' ב"ש השלושה'),
             # Arrival and returnee: the source is before the *current* spell.
             membership("arrival", 20, "netanya", "מכבי נתניה"),
             # The observed seasons are deliberately not consecutive: absent
@@ -120,6 +123,12 @@ class PlayerMovementsTests(unittest.TestCase):
     def test_hapoel_scope_is_exact_and_covers_verified_variants(self):
         self.assertTrue(is_hapoel_beer_sheva_team({"team_id": "2085", "team_name": 'הפועל ב"ש'}))
         self.assertTrue(is_hapoel_beer_sheva_team({"team_id": "new", "team_name": "הפועל באר שבע"}))
+        self.assertTrue(is_hapoel_beer_sheva_team({"team_id": "2373", "team_name": "anything"}))
+        for team_name in ("הפועל באר שבע השלושה", 'הפועל ב"ש השלושה', 'הפ\' ב"ש השלושה'):
+            with self.subTest(team_name=team_name):
+                self.assertTrue(
+                    is_hapoel_beer_sheva_team({"team_id": "new-youth", "team_name": team_name})
+                )
         self.assertTrue(is_hapoel_beer_sheva_team({"team_id": "6485", "team_name": "anything"}))
         self.assertFalse(is_hapoel_beer_sheva_team({"team_id": "1039", "team_name": "מכבי באר שבע"}))
         self.assertFalse(is_hapoel_beer_sheva_team({"team_id": "7985", "team_name": "מ.ס באר שבע 2"}))
@@ -139,6 +148,7 @@ class PlayerMovementsTests(unittest.TestCase):
         self.assertTrue(search["former-one"]["former_hapoel_player"])
         self.assertTrue(search["former-multi-hapoel"]["former_hapoel_player"])
         self.assertFalse(search["still-hapoel"]["former_hapoel_player"])
+        self.assertFalse(search["three-youth"]["former_hapoel_player"])
         self.assertFalse(search["returnee"]["former_hapoel_player"])
         self.assertFalse(search["not-hapoel"]["former_hapoel_player"])
         self.assertFalse(search["ambiguous"]["former_hapoel_player"])
@@ -150,6 +160,7 @@ class PlayerMovementsTests(unittest.TestCase):
         current_ids = {entry["player_id"] for entry in report["current_players"]}
         self.assertIn("former-multi-hapoel", former_ids)
         self.assertIn("returnee", current_ids)
+        self.assertIn("three-youth", current_ids)
 
     def test_initialization_and_movements_only_cache_hapoel_timelines(self):
         # Building the search index must not materialize a canonical career for
