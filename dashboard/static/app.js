@@ -9,7 +9,15 @@ const PIN_SINGLE = 22;
 const el = (id) => document.getElementById(id);
 const num = (value) => (value === null || value === undefined ? "—" : Number(value).toLocaleString("he-IL"));
 
-const state = { players: [], selected: null, map: null, layer: null, primed: false };
+const state = {
+  players: [],
+  selected: null,
+  player: null,
+  favorites: new Map(),
+  map: null,
+  layer: null,
+  primed: false,
+};
 
 function addLocationFilters() {
   const filters = document.querySelector(".filters");
@@ -48,15 +56,22 @@ async function getJSON(url) {
   return response.json();
 }
 
+async function sendJSON(method, url, body) {
+  const response = await fetch(url, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!response.ok) {
+    // 503 means favorites.csv is locked, usually because it is open in Excel.
+    const reason = response.status === 503 ? "הקובץ favorites.csv פתוח בתוכנה אחרת" : `שגיאה ${response.status}`;
+    throw new Error(reason);
+  }
+  return response.json();
+}
+
 async function loadSummary() {
   const summary = await getJSON("/api/summary");
-  const historyText = summary.history_seasons?.length
-    ? ` · היסטוריה ${summary.history_seasons.at(-1)}–${summary.history_seasons[0]}`
-    : "";
-  el("dataset").textContent =
-    `${num(summary.players)} שחקנים · ${num(summary.teams_located)}/${num(summary.teams)} קבוצות מאותרות · ` +
-    `${num(summary.above_age)} משחקים מעל הגיל · סטטיסטיקה ${summary.seasons.join(", ")}${historyText}`;
-
   fillSelect(el("birth-year"), summary.birth_years, (year) => `נולדו ${year}`);
   fillSelect(el("current-team"), summary.current_teams);
   fillLocations(summary.locations || []);
@@ -139,7 +154,7 @@ function renderResults() {
     const sub = document.createElement("div");
     sub.className = "result-sub";
     const born = player.birth_year ? `נולד ${player.birth_year}` : "שנת לידה לא ידועה";
-    sub.textContent = `${born} · ${player.current_team || "—"} · ${player.goals_total} שערים`;
+    sub.textContent = `${born} · ${player.current_team || "—"}`;
 
     item.append(name, sub);
     item.addEventListener("click", () => selectPlayer(player.player_id));
@@ -147,17 +162,229 @@ function renderResults() {
   }
 }
 
+/* -------------------------------- favourites -------------------------------- */
+
+async function loadFavorites() {
+  const favorites = await getJSON("/api/favorites");
+  state.favorites = new Map(favorites.map((favorite) => [favorite.player_id, favorite]));
+  renderFavorites();
+}
+
+function renderFavorites() {
+  const list = el("favorites");
+  list.replaceChildren();
+  const count = state.favorites.size;
+  el("favorites-count").textContent = count ? `(${count})` : "";
+  el("favorites-meta").textContent = count === 1 ? "שחקן מועדף אחד" : count ? `${count} שחקנים מועדפים` : "";
+
+  if (!count) {
+    const note = document.createElement("li");
+    note.className = "empty-note";
+    note.textContent = "עדיין אין מועדפים. כדי להוסיף, לחצו על \"☆ הוספה למועדפים\" בכרטיס של שחקן.";
+    list.append(note);
+    return;
+  }
+
+  // The Map keeps the server's newest-first order, with fresh additions put in front.
+  for (const favorite of state.favorites.values()) {
+    const item = document.createElement("li");
+    if (favorite.player_id === state.selected) item.classList.add("active");
+
+    const name = document.createElement("div");
+    name.className = "result-name";
+    const label = document.createElement("span");
+    label.className = "fav-name";
+    label.textContent = favorite.player_name || `שחקן #${favorite.player_id}`;
+    name.append(label);
+    if (favorite.notes.trim()) {
+      const note = document.createElement("span");
+      note.className = "fav-note";
+      note.textContent = favorite.notes.trim().split("\n")[0];
+      note.title = favorite.notes;
+      name.append(note);
+    }
+
+    const sub = document.createElement("div");
+    sub.className = "result-sub";
+    const born = favorite.birth_year ? `נולד ${favorite.birth_year}` : "שנת לידה לא ידועה";
+    sub.textContent = `${favorite.current_team || "—"} · ${born}`;
+
+    item.append(name, sub);
+    item.addEventListener("click", () => selectPlayer(favorite.player_id));
+    list.append(item);
+  }
+}
+
+// The two header tabs swap the sidebar between search and favourites; the player card
+// on the right stays as it is, so a scout can flip views without losing their place.
+function showSidebarView(view) {
+  for (const [name, tab, panel] of [
+    ["search", el("tab-search"), el("search-view")],
+    ["favorites", el("tab-favorites"), el("favorites-view")],
+  ]) {
+    tab.setAttribute("aria-selected", String(name === view));
+    panel.hidden = name !== view;
+  }
+}
+
+function renderFavoriteControls(player) {
+  const favorite = state.favorites.get(player.player_id);
+  const button = el("favorite-toggle");
+  button.setAttribute("aria-pressed", String(Boolean(favorite)));
+  button.classList.toggle("is-favorite", Boolean(favorite));
+  button.querySelector(".star-icon").textContent = favorite ? "★" : "☆";
+  button.querySelector(".star-label").textContent = favorite ? "במועדפים" : "הוספה למועדפים";
+  button.title = favorite ? "הסרה מהמועדפים" : "הוספה למועדפים";
+
+  el("favorite-notes").hidden = !favorite;
+  el("notes-input").value = favorite ? favorite.notes : "";
+  setNotesStatus("");
+}
+
+function setNotesStatus(text, kind = "") {
+  const status = el("notes-status");
+  status.textContent = text;
+  status.className = `notes-status ${kind}`.trim();
+}
+
+async function toggleFavorite() {
+  const player = state.player;
+  if (!player) return;
+  const favorite = state.favorites.get(player.player_id);
+  try {
+    if (favorite) {
+      if (favorite.notes.trim() && !confirm("להסיר את השחקן מהמועדפים? ההערות שלו יימחקו.")) return;
+      await sendJSON("DELETE", `/api/favorites/${player.player_id}`);
+      state.favorites.delete(player.player_id);
+    } else {
+      const saved = await sendJSON("PUT", `/api/favorites/${player.player_id}`, {});
+      state.favorites = new Map([[saved.player_id, saved], ...state.favorites]);
+    }
+  } catch (error) {
+    alert(`השמירה נכשלה: ${error.message}`);
+    return;
+  }
+  renderFavorites();
+  renderFavoriteControls(player);
+  renderMatches(player);
+}
+
+async function saveNotes() {
+  const player = state.player;
+  if (!player || !state.favorites.has(player.player_id)) return;
+  const button = el("notes-save");
+  button.disabled = true;
+  try {
+    const saved = await sendJSON("PUT", `/api/favorites/${player.player_id}`, {
+      notes: el("notes-input").value,
+    });
+    state.favorites.set(saved.player_id, saved);
+    renderFavorites();
+    setNotesStatus("נשמר ✓", "ok");
+  } catch (error) {
+    setNotesStatus(`השמירה נכשלה: ${error.message}`, "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+/* ------------------------------ recent matches ------------------------------ */
+
+function formatDate(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value || "");
+  return match ? `${match[3]}/${match[2]}/${match[1]}` : value || "—";
+}
+
+async function renderMatches(player) {
+  const panel = el("matches-panel");
+  const body = el("matches-body");
+  if (!state.favorites.has(player.player_id)) {
+    panel.hidden = true;
+    body.replaceChildren();
+    return;
+  }
+  panel.hidden = false;
+
+  const result = await getJSON(`/api/player/${player.player_id}/matches`);
+  // A slow response must not paint over a player selected in the meantime.
+  if (state.selected !== player.player_id) return;
+  body.replaceChildren();
+
+  if (!result.available || !result.matches.length) {
+    const note = document.createElement("p");
+    note.className = "matches-empty";
+    note.textContent = result.available
+      ? "לא נמצאו משחקים לשחקן הזה בקובץ המשחקים."
+      : "נתוני משחקים יתעדכנו אוטומטית בעדכון השבועי";
+    body.append(note);
+    return;
+  }
+
+  const table = document.createElement("table");
+  table.className = "seasons matches";
+  table.innerHTML =
+    "<thead><tr><th>תאריך</th><th>קבוצה</th><th>יריבה</th><th>תחרות</th>" +
+    "<th>דק׳</th><th>הרכב</th><th>שערים</th><th>כרטיסים</th></tr></thead>";
+  const rows = document.createElement("tbody");
+
+  for (const match of result.matches) {
+    const row = document.createElement("tr");
+    const cells = [
+      { text: formatDate(match.match_date), className: "season-cell" },
+      { text: match.team_name || `קבוצה #${match.team_id}` },
+      { text: match.opponent_name || (match.opponent_team_id ? `קבוצה #${match.opponent_team_id}` : "—") },
+      { text: match.competition_name || (match.competition_id ? `תחרות #${match.competition_id}` : "—") },
+      { text: num(match.minutes_played), className: "num" },
+      { text: match.is_starter === null ? "—" : match.is_starter ? "פותח" : "מחליף" },
+      { text: num(match.goals), className: "num" },
+    ];
+    for (const cell of cells) {
+      const td = document.createElement("td");
+      td.textContent = cell.text;
+      if (cell.className) td.className = cell.className;
+      row.append(td);
+    }
+
+    const cards = document.createElement("td");
+    if (match.yellow_cards) {
+      const pill = document.createElement("span");
+      pill.className = "card-pill card-yellow";
+      pill.textContent = match.yellow_cards;
+      cards.append(pill);
+    }
+    if (match.red_cards) {
+      const pill = document.createElement("span");
+      pill.className = "card-pill card-red";
+      pill.textContent = match.red_cards;
+      cards.append(pill);
+    }
+    if (!match.yellow_cards && !match.red_cards) cards.textContent = "—";
+    row.append(cards);
+    rows.append(row);
+  }
+
+  table.append(rows);
+  body.append(table);
+}
+
 /* ------------------------------ player view ------------------------------ */
 
 async function selectPlayer(playerId) {
   state.selected = playerId;
   renderResults();
+  renderFavorites();
   const player = await getJSON(`/api/player/${playerId}`);
+  if (state.selected !== playerId) return;
+  state.player = player;
   el("player").hidden = false;
   renderHeader(player);
+  renderFavoriteControls(player);
   renderTiles(player);
   renderSeasons(player);
   renderMap(player);
+  renderMatches(player).catch((error) => {
+    el("matches-body").textContent = `שגיאה בטעינת המשחקים: ${error.message}`;
+  });
 }
 
 function renderHeader(player) {
@@ -173,80 +400,140 @@ function renderHeader(player) {
     photo.removeAttribute("src");
   }
 
-  const born = player.birth_year ? `נולד ${player.birth_year}` : "שנת לידה לא ידועה";
-  el("player-meta").textContent =
-    `#${player.player_id} · ${born} · ${player.current_team || "—"} · ` +
-    `${player.num_teams} קבוצות · עונות ${player.seasons_played}`;
+  // One uniform label/value list instead of a grey meta line plus a row of pills.
+  const facts = [
+    { label: "קבוצה נוכחית", value: player.current_team || "—" },
+    ageGroupFact(player),
+    { label: "שנת לידה", value: player.birth_year || "לא ידועה" },
+  ];
 
-  const badges = el("player-badges");
-  badges.replaceChildren();
-
-  const ageBadge = document.createElement("span");
-  if (player.plays_above_age) {
-    ageBadge.className = "badge badge-up";
-    ageBadge.textContent = `משחק ${player.age_groups_above} קבוצות גיל מעל גילו`;
-  } else {
-    ageBadge.className = "badge badge-ok";
-    ageBadge.textContent = "משחק בקבוצת הגיל שלו";
-  }
-  badges.append(ageBadge);
-
-  // Always show the earliest registered club when the backend can identify one.
-  // This is factual registration history; it is deliberately kept separate from the
-  // inferred origin-area badge below.
+  // The earliest registered club is factual registration history; it is kept apart
+  // from the inferred origin area below.
   if (player.first_club) {
-    const firstClubBadge = document.createElement("span");
-    firstClubBadge.className = "badge badge-first-club";
-    const firstSeason = player.first_registered_season
-      ? ` · ${player.first_registered_season}`
-      : "";
-    firstClubBadge.textContent = `מועדון ראשון: ${player.first_club}${firstSeason}`;
-    firstClubBadge.title = "המועדון המוקדם ביותר שנמצא בהיסטוריית הרישום הזמינה של ההתאחדות.";
-    badges.append(firstClubBadge);
+    const season = player.first_registered_season ? ` (${player.first_registered_season})` : "";
+    facts.push({
+      label: "מועדון ראשון",
+      value: `${player.first_club}${season}`,
+      title: "המועדון המוקדם ביותר שנמצא בהיסטוריית הרישום הזמינה של ההתאחדות.",
+    });
   }
 
-  const originBadge = document.createElement("span");
-  if (player.likely_origin_city) {
-    const confidence = player.likely_origin_confidence === "medium" ? "בינוני" : "נמוך";
-    originBadge.className = "badge badge-origin";
-    originBadge.textContent = `אזור מוצא משוער: ${player.likely_origin_city} · ביטחון ${confidence}`;
-    const basis = player.likely_origin_basis || {};
-    const clubs = Array.isArray(basis.clubs) ? basis.clubs.join(" / ") : "";
-    const age = Number.isInteger(basis.approx_age) ? `, גיל משוער ${basis.approx_age}` : "";
-    originBadge.title = `הערכה לפי המועדון הראשון הרשום${clubs ? `: ${clubs}` : ""}${basis.season ? ` (${basis.season}${age})` : ""}. אינה כתובת מגורים מאומתת.`;
-    badges.append(originBadge);
-  } else if (player.likely_origin_confidence === "ambiguous" && player.likely_origin_candidates?.length) {
-    originBadge.className = "badge badge-origin badge-origin-ambiguous";
-    originBadge.textContent = `אזור מוצא לא חד-משמעי: ${player.likely_origin_candidates.join(" / ")}`;
-    originBadge.title = "בשנת הרישום הראשונה נמצאו מועדונים ביותר מעיר אחת, ולכן לא נבחרה עיר יחידה.";
-    badges.append(originBadge);
-  }
-
-  for (const group of player.age_groups.split(", ").filter(Boolean)) {
-    const badge = document.createElement("span");
-    badge.className = "badge";
-    badge.textContent = group;
-    badges.append(badge);
-  }
+  const origin = originFact(player);
+  if (origin) facts.push(origin);
 
   if (player.above_age_history) {
-    const badge = document.createElement("span");
-    badge.className = "badge badge-up";
-    badge.textContent = `היסטוריה: ${player.above_age_history}`;
-    badges.append(badge);
+    facts.push({ label: "היסטוריה מעל הגיל", value: player.above_age_history, className: "fact-up" });
+  }
+  facts.push({ label: "מס׳ שחקן", value: player.player_id });
+
+  const list = el("player-facts");
+  list.replaceChildren();
+  for (const fact of facts) {
+    const item = document.createElement("div");
+    item.className = "fact";
+    if (fact.title) item.title = fact.title;
+    const term = document.createElement("dt");
+    term.textContent = fact.label;
+    const value = document.createElement("dd");
+    value.textContent = fact.value;
+    if (fact.className) value.className = fact.className;
+    item.append(term, value);
+    list.append(item);
   }
 }
 
-function renderTiles(player) {
-  const t = player.totals;
-  const tiles = [
-    { label: "שערים", value: num(t.goals_total), note: `ליגה ${num(t.goals_league)} · גביע ${num(t.goals_cup)}` },
-    { label: "משחקים", value: num(t.games_total), note: `פותח ${num(t.starts)} · מחליף ${num(t.sub_on)}` },
-    { label: "דקות משחק", value: num(t.minutes_total), note: `${num(t.avg_minutes_per_game)} בממוצע למשחק` },
-    { label: "כרטיסים צהובים", value: num(t.yellow_cards_total), note: "ליגה, גביע וטוטו" },
-    { label: "כרטיסים אדומים", value: num(t.red_cards), note: "" },
-    { label: "קבוצות", value: num(player.num_teams), note: "בכל העונות" },
+function ageGroupFact(player) {
+  const label = "קבוצת גיל נוכחית";
+  const group = player.current_age_group || "—";
+  if (player.plays_above_age) {
+    // The left-to-right mark keeps the "+" in front of the number on an RTL page.
+    return { label, value: `${group} · ‎+${player.age_groups_above} מעל גילו`, className: "fact-up" };
+  }
+  return { label, value: `${group} · בקבוצת הגיל שלו` };
+}
+
+function originFact(player) {
+  const label = "אזור מוצא משוער";
+  if (player.likely_origin_city) {
+    const confidence = player.likely_origin_confidence === "medium" ? "בינוני" : "נמוך";
+    const basis = player.likely_origin_basis || {};
+    const clubs = Array.isArray(basis.clubs) ? basis.clubs.join(" / ") : "";
+    const age = Number.isInteger(basis.approx_age) ? `, גיל משוער ${basis.approx_age}` : "";
+    return {
+      label,
+      value: `${player.likely_origin_city} (ביטחון ${confidence})`,
+      title: `הערכה לפי המועדון הראשון הרשום${clubs ? `: ${clubs}` : ""}${basis.season ? ` (${basis.season}${age})` : ""}. אינה כתובת מגורים מאומתת.`,
+    };
+  }
+  if (player.likely_origin_confidence === "ambiguous" && player.likely_origin_candidates?.length) {
+    return {
+      label,
+      value: `לא חד-משמעי: ${player.likely_origin_candidates.join(" / ")}`,
+      title: "בשנת הרישום הראשונה נמצאו מועדונים ביותר מעיר אחת, ולכן לא נבחרה עיר יחידה.",
+    };
+  }
+  return null;
+}
+
+const pct = (value) => (value === null || value === undefined ? "—" : `${Math.round(value * 100)}%`);
+const rate = (value) => (value === null || value === undefined ? "—" : value.toFixed(2));
+
+function trendTile(m) {
+  const label = "מגמה מול עונה קודמת";
+  const previous = m.previous;
+  if (!previous) return { label, value: "—", note: "אין עונה קודמת להשוואה" };
+  if (m.goals_per_match === null || previous.goals_per_match === null) {
+    return { label, value: "—", note: "אין נתוני שערים להשוואה" };
+  }
+  const delta = m.goals_per_match - previous.goals_per_match;
+  // Rounded first, so a tiny change that displays as 0.00 is not coloured as a trend.
+  const shown = Math.round(delta * 100) / 100;
+  return {
+    label,
+    // The left-to-right mark keeps the sign in front of the number on an RTL page.
+    value: `‎${shown > 0 ? "+" : ""}${shown.toFixed(2)}`,
+    className: shown > 0 ? "trend-up" : shown < 0 ? "trend-down" : "",
+    note: `בשערים למשחק, לעומת ${previous.season}`,
+  };
+}
+
+function minutesShareNote(m) {
+  const minutes = `${num(m.minutes)} דקות`;
+  // The season-on-season minutes comparison lives here, beside the metric it is about.
+  if (!m.previous || m.previous.minutes_share === null) return minutes;
+  return `${minutes} · לעומת ${pct(m.previous.minutes_share)} ב-${m.previous.season}`;
+}
+
+function metricTiles(m) {
+  const peers = m.goals_percentile === null
+    ? `פחות מ-${m.min_minutes_for_rank} דקות, אין השוואה`
+    : m.goals_percentile === 100
+      ? `הגבוה ביותר ב${m.age_group}`
+      : `גבוה מ-${m.goals_percentile}% מהשחקנים ב${m.age_group}`;
+  return [
+    { label: "שערים למשחק מלא", value: rate(m.goals_per_match), note: `${num(m.goals)} שערים · ${peers}` },
+    { label: "חלק משערי הקבוצה", value: pct(m.team_goal_share), note: `${num(m.goals)} מתוך ${num(m.team_goals)} שערים` },
+    { label: "חלק מהדקות האפשריות", value: pct(m.minutes_share), note: minutesShareNote(m) },
+    { label: "אחוז פתיחות", value: pct(m.start_rate), note: `${num(m.starts)} פתיחות ב-${num(m.games)} משחקים` },
+    { label: "משחקים מלאים", value: num(m.full_matches_played), note: `פתח וסיים, מתוך ${num(m.starts)} פתיחות` },
+    trendTile(m),
   ];
+}
+
+function renderTiles(player) {
+  const m = player.metrics;
+  const caption = el("tiles-caption");
+  if (m) {
+    const why = m.is_reference_season ? "" : " · העונה האחרונה שבה שיחק";
+    caption.textContent = `מדדי עונה ${m.season} · ${m.age_group}${why}`;
+  } else {
+    caption.textContent = "אין לשחקן משחקים בעונות שיש עליהן סטטיסטיקה";
+  }
+
+  const tiles = m
+    ? metricTiles(m)
+    : ["שערים למשחק מלא", "חלק משערי הקבוצה", "חלק מהדקות האפשריות", "אחוז פתיחות", "משחקים מלאים", "מגמה מול עונה קודמת"]
+        .map((label) => ({ label, value: "—", note: "" }));
 
   const container = el("tiles");
   container.replaceChildren();
@@ -257,7 +544,7 @@ function renderTiles(player) {
     label.className = "tile-label";
     label.textContent = tile.label;
     const value = document.createElement("div");
-    value.className = "tile-value";
+    value.className = `tile-value ${tile.className || ""}`.trim();
     value.textContent = tile.value;
     box.append(label, value);
     if (tile.note) {
@@ -321,7 +608,7 @@ function renderSeasons(player) {
     if (!yellows && !season.red_cards) cards.textContent = "—";
 
     row.append(seasonCell, teamCell, ageCell);
-    for (const value of [season.games, season.goals, season.minutes]) {
+    for (const value of [season.games, season.goals]) {
       const cell = document.createElement("td");
       cell.className = "num";
       cell.textContent = num(value);
@@ -466,7 +753,15 @@ el("birth-year").addEventListener("change", loadResults);
 el("current-team").addEventListener("change", loadResults);
 el("location").addEventListener("change", loadResults);
 el("radius-km").addEventListener("change", loadResults);
+el("tab-search").addEventListener("click", () => showSidebarView("search"));
+el("tab-favorites").addEventListener("click", () => showSidebarView("favorites"));
+el("favorite-toggle").addEventListener("click", toggleFavorite);
+el("notes-save").addEventListener("click", saveNotes);
+el("notes-input").addEventListener("input", () => setNotesStatus("יש שינויים שלא נשמרו", "dirty"));
 
-loadSummary().then(loadResults).catch((error) => {
+// Favourites load first so the opening player's star is already right.
+loadSummary().then(loadFavorites).then(loadResults).catch((error) => {
+  // The dataset line is hidden normally and only surfaces to report a load failure.
   el("dataset").textContent = `שגיאה בטעינת הנתונים: ${error.message}`;
+  el("dataset").hidden = false;
 });

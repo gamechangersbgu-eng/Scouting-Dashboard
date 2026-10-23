@@ -11,10 +11,22 @@
 <div class="app">
   <aside class="sidebar">
     <header class="brand">
-      <h1>סקאוטינג נוער</h1>
-      <p class="dataset" id="dataset">טוען נתונים…</p>
+      <div class="brand-row">
+        <h1>סקאוטינג נוער</h1>
+        <div class="view-tabs" role="tablist" aria-label="תצוגת סרגל הצד">
+          <button type="button" class="view-tab" role="tab" id="tab-search"
+                  aria-selected="true" aria-controls="search-view">חיפוש</button>
+          <button type="button" class="view-tab" role="tab" id="tab-favorites"
+                  aria-selected="false" aria-controls="favorites-view">
+            <span class="star-mark" aria-hidden="true">★</span> מועדפים
+            <span class="count" id="favorites-count"></span>
+          </button>
+        </div>
+      </div>
+      <p class="dataset" id="dataset" hidden></p>
     </header>
 
+    <div class="sidebar-view" id="search-view" role="tabpanel" aria-labelledby="tab-search">
     <div class="controls">
       <label class="field search-field">
         <span class="sr-only">חיפוש שחקן</span>
@@ -32,7 +44,7 @@
             <option value="">כל שנות הלידה</option>
           </select>
         </label>
-        <label class="field select-field">
+        <label class="field select-field field-wide">
           <span class="sr-only">קבוצה נוכחית</span>
           <select id="current-team">
             <option value="">כל הקבוצות</option>
@@ -49,6 +61,12 @@
 
     <p class="results-meta" id="results-meta"></p>
     <ul class="results" id="results"></ul>
+    </div>
+
+    <div class="sidebar-view" id="favorites-view" role="tabpanel" aria-labelledby="tab-favorites" hidden>
+      <p class="results-meta" id="favorites-meta"></p>
+      <ul class="results favorites" id="favorites"></ul>
+    </div>
   </aside>
 
   <main class="main">
@@ -57,12 +75,31 @@
         <img class="player-photo" id="player-photo" alt="" hidden>
         <div class="player-identity">
           <h2 id="player-name"></h2>
-          <p class="player-meta" id="player-meta"></p>
-          <div class="badges" id="player-badges"></div>
+          <dl class="facts" id="player-facts"></dl>
+        </div>
+        <div class="favorite-box">
+          <button type="button" class="star-button" id="favorite-toggle" aria-pressed="false">
+            <span class="star-icon" aria-hidden="true">☆</span>
+            <span class="star-label">הוספה למועדפים</span>
+          </button>
+          <div class="favorite-notes" id="favorite-notes" hidden>
+            <label for="notes-input">הערות</label>
+            <textarea id="notes-input" rows="3" placeholder="מה ראית בשחקן?"></textarea>
+            <div class="notes-actions">
+              <span class="notes-status" id="notes-status" role="status"></span>
+              <button type="button" class="save-button" id="notes-save">שמירה</button>
+            </div>
+          </div>
         </div>
       </header>
 
-      <section class="tiles" id="tiles"></section>
+      <section class="panel matches-panel" id="matches-panel" hidden>
+        <div class="panel-head">
+          <h3>משחקים אחרונים</h3>
+          <p class="hint">5 המשחקים האחרונים</p>
+        </div>
+        <div id="matches-body"></div>
+      </section>
 
       <div class="panels">
         <section class="panel map-panel">
@@ -89,7 +126,7 @@
               <thead>
                 <tr>
                   <th>עונה</th><th>קבוצה</th><th>קב׳ גיל</th>
-                  <th>מש׳</th><th>שערים</th><th>דקות</th><th>כרטיסים</th>
+                  <th>מש׳</th><th>שערים</th><th>כרטיסים</th>
                 </tr>
               </thead>
               <tbody id="seasons-body"></tbody>
@@ -97,12 +134,15 @@
           </div>
         </section>
       </div>
+
+      <p class="tiles-caption" id="tiles-caption"></p>
+      <section class="tiles" id="tiles"></section>
     </article>
   </main>
 </div>
 
 <script src="/static/league-filter.js"></script>
 <script src="/static/leaflet.js"></script>
-<script src="/static/app.js?v=career-history-origin-v2"></script>
+<script src="/static/app.js?v=header-facts-v2"></script>
 </body>
 </html>
