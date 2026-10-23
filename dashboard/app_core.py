@@ -8,10 +8,12 @@ database. Run it with:
 """
 
 import argparse
+import bisect
 import csv
 import logging
 import math
 import os
+import statistics
 import tempfile
 import threading
 import webbrowser
@@ -40,6 +42,16 @@ TOTAL_FIELDS = [
     "yellow_cards_total",
     "red_cards",
 ]
+
+# Regulation match length per age bracket. The younger brackets play shorter halves,
+# so per-match rates are normalised per bracket rather than per 90 minutes.
+MATCH_MINUTES = {"נוער": 90, "נערים א": 90, "נערים ב": 80, "נערים ג": 80}
+DEFAULT_MATCH_MINUTES = 90
+# Below this many minutes a scoring rate is too noisy to rank against peers.
+MIN_MINUTES_FOR_RANK = 450
+# A season becomes the reference season for the tiles once a typical team has played
+# this many games, so a season that has only just started does not hide the last one.
+MIN_TEAM_GAMES_FOR_SEASON = 10
 
 SEASON_STAT_FIELDS = [
     "games",
@@ -211,6 +223,7 @@ class ScoutingData:
         for row in self.history_rows:
             self.history_by_player[row["player_id"]].append(row)
 
+        self._build_season_metrics()
 
         # Recomputed here rather than read from the CSV because players_youth.csv only
         # carries the aggregate flag, while the season table shows a flag per spell.
@@ -433,6 +446,149 @@ class ScoutingData:
 
         return [{k: v for k, v in e.items() if k != "haystack"} for e in results[:limit]]
 
+    def _build_season_metrics(self):
+        """Pre-aggregate player_season_stats.csv for the per-season tile metrics.
+
+        Everything here comes from the season table rather than players_youth.csv, so
+        the tiles keep working unchanged once the data moves to a normalised schema.
+        The dataset has no team fixture list, so a team's game count is taken as the
+        most games any of its players logged that season.
+        """
+        team_games = defaultdict(int)
+        team_goals = defaultdict(int)
+        for row in self.season_rows:
+            key = (int(row["season_id"]), _text(row.get("team_id")))
+            team_games[key] = max(team_games[key], _int_or_none(row.get("games")) or 0)
+            team_goals[key] += _int_or_none(row.get("goals")) or 0
+
+        games_by_season = defaultdict(list)
+        for (season_id, _), games in team_games.items():
+            games_by_season[season_id].append(games)
+        mature = [
+            season_id
+            for season_id, games in games_by_season.items()
+            if statistics.median(games) >= MIN_TEAM_GAMES_FOR_SEASON
+        ]
+        self.reference_season_id = max(mature or games_by_season, default=None)
+
+        # (player_id, season_id) -> totals across every team the player had that season.
+        aggregates = {}
+        for row in self.season_rows:
+            games = _int_or_none(row.get("games")) or 0
+            season_id = int(row["season_id"])
+            key = (row["player_id"], season_id)
+            agg = aggregates.setdefault(
+                key,
+                {
+                    "season_id": season_id,
+                    "season": _text(row.get("season")),
+                    "games": 0,
+                    "goals": 0,
+                    "minutes": 0,
+                    "starts": 0,
+                    "sub_off": 0,
+                    "full_matches": 0.0,
+                    "team_goals": 0,
+                    "possible_minutes": 0,
+                    "minutes_by_age_group": defaultdict(int),
+                },
+            )
+            if not games:
+                # A squad listing without appearances says nothing about the player's
+                # share of that team, so it must not dilute the team-share metrics.
+                continue
+            age_group = _text(row.get("age_group"))
+            match_minutes = MATCH_MINUTES.get(age_group, DEFAULT_MATCH_MINUTES)
+            minutes = _int_or_none(row.get("minutes")) or 0
+            team_key = (season_id, _text(row.get("team_id")))
+            agg["games"] += games
+            agg["goals"] += _int_or_none(row.get("goals")) or 0
+            agg["minutes"] += minutes
+            agg["starts"] += _int_or_none(row.get("starts")) or 0
+            agg["sub_off"] += _int_or_none(row.get("sub_off")) or 0
+            agg["full_matches"] += minutes / match_minutes
+            agg["team_goals"] += team_goals[team_key]
+            agg["possible_minutes"] += team_games[team_key] * match_minutes
+            agg["minutes_by_age_group"][age_group] += minutes
+
+        self.season_aggregates = {}
+        self.played_seasons = defaultdict(list)
+        rate_pools = defaultdict(list)
+        for key, agg in aggregates.items():
+            by_age = agg.pop("minutes_by_age_group")
+            # Peers are the bracket where the player spent most of that season.
+            agg["age_group"] = max(by_age, key=by_age.get) if by_age else ""
+            self.season_aggregates[key] = agg
+            if agg["games"]:
+                self.played_seasons[key[0]].append(key[1])
+            if agg["minutes"] >= MIN_MINUTES_FOR_RANK and agg["full_matches"]:
+                rate_pools[(agg["season_id"], agg["age_group"])].append(
+                    agg["goals"] / agg["full_matches"]
+                )
+        self.rate_pools = {key: sorted(values) for key, values in rate_pools.items()}
+
+    @staticmethod
+    def _rates(agg):
+        return {
+            "goals_per_match": agg["goals"] / agg["full_matches"]
+            if agg["full_matches"]
+            else None,
+            # Capped at 1: the team game count is an estimate and can run short.
+            "minutes_share": min(agg["minutes"] / agg["possible_minutes"], 1.0)
+            if agg["possible_minutes"]
+            else None,
+        }
+
+    def season_metrics(self, player_id):
+        """Tile metrics for the reference season, or the player's latest played one."""
+        played = sorted(self.played_seasons.get(player_id, []))
+        if not played:
+            return None
+        current_id = self.reference_season_id if self.reference_season_id in played else played[-1]
+        previous_id = max((sid for sid in played if sid < current_id), default=None)
+
+        agg = self.season_aggregates[(player_id, current_id)]
+        rates = self._rates(agg)
+
+        percentile = None
+        pool = self.rate_pools.get((current_id, agg["age_group"]), [])
+        if len(pool) > 1 and agg["minutes"] >= MIN_MINUTES_FOR_RANK:
+            # Share of the *other* peers this player scores more often than; the player
+            # is in the pool, and ties are not "beaten". Floored, so only the very top
+            # scorer reaches 100.
+            beaten = bisect.bisect_left(pool, rates["goals_per_match"])
+            percentile = math.floor(100 * beaten / (len(pool) - 1))
+
+        previous = None
+        if previous_id is not None:
+            previous_agg = self.season_aggregates[(player_id, previous_id)]
+            previous = {"season": previous_agg["season"], **self._rates(previous_agg)}
+
+        def ratio(part, whole):
+            return part / whole if whole else None
+
+        return {
+            "season": agg["season"],
+            "season_id": current_id,
+            "is_reference_season": current_id == self.reference_season_id,
+            "age_group": agg["age_group"],
+            "games": agg["games"],
+            "goals": agg["goals"],
+            "minutes": agg["minutes"],
+            "starts": agg["starts"],
+            "goals_per_match": rates["goals_per_match"],
+            "goals_percentile": percentile,
+            "rank_pool_size": len(pool),
+            "min_minutes_for_rank": MIN_MINUTES_FOR_RANK,
+            "team_goals": agg["team_goals"],
+            "team_goal_share": ratio(agg["goals"], agg["team_goals"]),
+            "minutes_share": rates["minutes_share"],
+            "start_rate": ratio(agg["starts"], agg["games"]),
+            # A start without being substituted off means the player saw the match out.
+            "full_matches_played": max(agg["starts"] - agg["sub_off"], 0),
+            "previous": previous,
+        }
+
     def player(self, player_id):
         """Full detail for one player, including club history before the stats window.
 
@@ -502,12 +658,14 @@ class ScoutingData:
 
         first_club = teams[0] if teams else {}
         origin = self._infer_likely_origin(teams, seasons, _clean(player.get("birth_year")))
+        current_spell = self._current_spell(stats_rows, _text(player.get("current_team")))
         return {
             "player_id": player_id,
             "player_name": player["player_name"],
             "birth_year": _clean(player.get("birth_year")),
             "image_url": _text(player.get("image_url")) or None,
             "current_team": _text(player.get("current_team")),
+            "current_age_group": _text(current_spell.get("age_group")),
             "num_teams": len(teams),
             "age_groups": _text(player.get("age_groups")),
             "leagues": _text(player.get("leagues")),
@@ -516,6 +674,7 @@ class ScoutingData:
             "age_groups_above": int(player.get("age_groups_above") or 0),
             "above_age_history": _text(player.get("above_age_history")),
             "totals": {f: _clean(player.get(f)) for f in TOTAL_FIELDS},
+            "metrics": self.season_metrics(player_id),
             "seasons": seasons[::-1],
             "teams": teams,
             "venues": venues,
@@ -531,6 +690,26 @@ class ScoutingData:
             "likely_origin_candidates": origin["candidates"],
             "likely_origin_basis": origin["basis"],
         }
+
+    @staticmethod
+    def _current_spell(stats_rows, current_team):
+        """The player's latest-season row from player_season_stats.csv.
+
+        A player can be registered with more than one squad in a season (e.g. playing
+        up a bracket at the same club), so the row matching the current team wins, and
+        otherwise the one with the most minutes.
+        """
+        if not stats_rows:
+            return {}
+        latest = max(int(row["season_id"]) for row in stats_rows)
+        rows = [row for row in stats_rows if int(row["season_id"]) == latest]
+        return max(
+            rows,
+            key=lambda row: (
+                _text(row.get("team_name")) == current_team,
+                _int_or_none(row.get("minutes")) or 0,
+            ),
+        )
 
     @staticmethod
     def _season_start_year(season_label):

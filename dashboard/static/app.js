@@ -154,7 +154,7 @@ function renderResults() {
     const sub = document.createElement("div");
     sub.className = "result-sub";
     const born = player.birth_year ? `נולד ${player.birth_year}` : "שנת לידה לא ידועה";
-    sub.textContent = `${born} · ${player.current_team || "—"} · ${player.goals_total} שערים`;
+    sub.textContent = `${born} · ${player.current_team || "—"}`;
 
     item.append(name, sub);
     item.addEventListener("click", () => selectPlayer(player.player_id));
@@ -400,80 +400,140 @@ function renderHeader(player) {
     photo.removeAttribute("src");
   }
 
-  const born = player.birth_year ? `נולד ${player.birth_year}` : "שנת לידה לא ידועה";
-  el("player-meta").textContent =
-    `#${player.player_id} · ${born} · ${player.current_team || "—"} · ` +
-    `${player.num_teams} קבוצות · עונות ${player.seasons_played}`;
+  // One uniform label/value list instead of a grey meta line plus a row of pills.
+  const facts = [
+    { label: "קבוצה נוכחית", value: player.current_team || "—" },
+    ageGroupFact(player),
+    { label: "שנת לידה", value: player.birth_year || "לא ידועה" },
+  ];
 
-  const badges = el("player-badges");
-  badges.replaceChildren();
-
-  const ageBadge = document.createElement("span");
-  if (player.plays_above_age) {
-    ageBadge.className = "badge badge-up";
-    ageBadge.textContent = `משחק ${player.age_groups_above} קבוצות גיל מעל גילו`;
-  } else {
-    ageBadge.className = "badge badge-ok";
-    ageBadge.textContent = "משחק בקבוצת הגיל שלו";
-  }
-  badges.append(ageBadge);
-
-  // Always show the earliest registered club when the backend can identify one.
-  // This is factual registration history; it is deliberately kept separate from the
-  // inferred origin-area badge below.
+  // The earliest registered club is factual registration history; it is kept apart
+  // from the inferred origin area below.
   if (player.first_club) {
-    const firstClubBadge = document.createElement("span");
-    firstClubBadge.className = "badge badge-first-club";
-    const firstSeason = player.first_registered_season
-      ? ` · ${player.first_registered_season}`
-      : "";
-    firstClubBadge.textContent = `מועדון ראשון: ${player.first_club}${firstSeason}`;
-    firstClubBadge.title = "המועדון המוקדם ביותר שנמצא בהיסטוריית הרישום הזמינה של ההתאחדות.";
-    badges.append(firstClubBadge);
+    const season = player.first_registered_season ? ` (${player.first_registered_season})` : "";
+    facts.push({
+      label: "מועדון ראשון",
+      value: `${player.first_club}${season}`,
+      title: "המועדון המוקדם ביותר שנמצא בהיסטוריית הרישום הזמינה של ההתאחדות.",
+    });
   }
 
-  const originBadge = document.createElement("span");
-  if (player.likely_origin_city) {
-    const confidence = player.likely_origin_confidence === "medium" ? "בינוני" : "נמוך";
-    originBadge.className = "badge badge-origin";
-    originBadge.textContent = `אזור מוצא משוער: ${player.likely_origin_city} · ביטחון ${confidence}`;
-    const basis = player.likely_origin_basis || {};
-    const clubs = Array.isArray(basis.clubs) ? basis.clubs.join(" / ") : "";
-    const age = Number.isInteger(basis.approx_age) ? `, גיל משוער ${basis.approx_age}` : "";
-    originBadge.title = `הערכה לפי המועדון הראשון הרשום${clubs ? `: ${clubs}` : ""}${basis.season ? ` (${basis.season}${age})` : ""}. אינה כתובת מגורים מאומתת.`;
-    badges.append(originBadge);
-  } else if (player.likely_origin_confidence === "ambiguous" && player.likely_origin_candidates?.length) {
-    originBadge.className = "badge badge-origin badge-origin-ambiguous";
-    originBadge.textContent = `אזור מוצא לא חד-משמעי: ${player.likely_origin_candidates.join(" / ")}`;
-    originBadge.title = "בשנת הרישום הראשונה נמצאו מועדונים ביותר מעיר אחת, ולכן לא נבחרה עיר יחידה.";
-    badges.append(originBadge);
-  }
-
-  for (const group of player.age_groups.split(", ").filter(Boolean)) {
-    const badge = document.createElement("span");
-    badge.className = "badge";
-    badge.textContent = group;
-    badges.append(badge);
-  }
+  const origin = originFact(player);
+  if (origin) facts.push(origin);
 
   if (player.above_age_history) {
-    const badge = document.createElement("span");
-    badge.className = "badge badge-up";
-    badge.textContent = `היסטוריה: ${player.above_age_history}`;
-    badges.append(badge);
+    facts.push({ label: "היסטוריה מעל הגיל", value: player.above_age_history, className: "fact-up" });
+  }
+  facts.push({ label: "מס׳ שחקן", value: player.player_id });
+
+  const list = el("player-facts");
+  list.replaceChildren();
+  for (const fact of facts) {
+    const item = document.createElement("div");
+    item.className = "fact";
+    if (fact.title) item.title = fact.title;
+    const term = document.createElement("dt");
+    term.textContent = fact.label;
+    const value = document.createElement("dd");
+    value.textContent = fact.value;
+    if (fact.className) value.className = fact.className;
+    item.append(term, value);
+    list.append(item);
   }
 }
 
-function renderTiles(player) {
-  const t = player.totals;
-  const tiles = [
-    { label: "שערים", value: num(t.goals_total), note: `ליגה ${num(t.goals_league)} · גביע ${num(t.goals_cup)}` },
-    { label: "משחקים", value: num(t.games_total), note: `פותח ${num(t.starts)} · מחליף ${num(t.sub_on)}` },
-    { label: "דקות משחק", value: num(t.minutes_total), note: `${num(t.avg_minutes_per_game)} בממוצע למשחק` },
-    { label: "כרטיסים צהובים", value: num(t.yellow_cards_total), note: "ליגה, גביע וטוטו" },
-    { label: "כרטיסים אדומים", value: num(t.red_cards), note: "" },
-    { label: "קבוצות", value: num(player.num_teams), note: "בכל העונות" },
+function ageGroupFact(player) {
+  const label = "קבוצת גיל נוכחית";
+  const group = player.current_age_group || "—";
+  if (player.plays_above_age) {
+    // The left-to-right mark keeps the "+" in front of the number on an RTL page.
+    return { label, value: `${group} · ‎+${player.age_groups_above} מעל גילו`, className: "fact-up" };
+  }
+  return { label, value: `${group} · בקבוצת הגיל שלו` };
+}
+
+function originFact(player) {
+  const label = "אזור מוצא משוער";
+  if (player.likely_origin_city) {
+    const confidence = player.likely_origin_confidence === "medium" ? "בינוני" : "נמוך";
+    const basis = player.likely_origin_basis || {};
+    const clubs = Array.isArray(basis.clubs) ? basis.clubs.join(" / ") : "";
+    const age = Number.isInteger(basis.approx_age) ? `, גיל משוער ${basis.approx_age}` : "";
+    return {
+      label,
+      value: `${player.likely_origin_city} (ביטחון ${confidence})`,
+      title: `הערכה לפי המועדון הראשון הרשום${clubs ? `: ${clubs}` : ""}${basis.season ? ` (${basis.season}${age})` : ""}. אינה כתובת מגורים מאומתת.`,
+    };
+  }
+  if (player.likely_origin_confidence === "ambiguous" && player.likely_origin_candidates?.length) {
+    return {
+      label,
+      value: `לא חד-משמעי: ${player.likely_origin_candidates.join(" / ")}`,
+      title: "בשנת הרישום הראשונה נמצאו מועדונים ביותר מעיר אחת, ולכן לא נבחרה עיר יחידה.",
+    };
+  }
+  return null;
+}
+
+const pct = (value) => (value === null || value === undefined ? "—" : `${Math.round(value * 100)}%`);
+const rate = (value) => (value === null || value === undefined ? "—" : value.toFixed(2));
+
+function trendTile(m) {
+  const label = "מגמה מול עונה קודמת";
+  const previous = m.previous;
+  if (!previous) return { label, value: "—", note: "אין עונה קודמת להשוואה" };
+  if (m.goals_per_match === null || previous.goals_per_match === null) {
+    return { label, value: "—", note: "אין נתוני שערים להשוואה" };
+  }
+  const delta = m.goals_per_match - previous.goals_per_match;
+  // Rounded first, so a tiny change that displays as 0.00 is not coloured as a trend.
+  const shown = Math.round(delta * 100) / 100;
+  return {
+    label,
+    // The left-to-right mark keeps the sign in front of the number on an RTL page.
+    value: `‎${shown > 0 ? "+" : ""}${shown.toFixed(2)}`,
+    className: shown > 0 ? "trend-up" : shown < 0 ? "trend-down" : "",
+    note: `בשערים למשחק, לעומת ${previous.season}`,
+  };
+}
+
+function minutesShareNote(m) {
+  const minutes = `${num(m.minutes)} דקות`;
+  // The season-on-season minutes comparison lives here, beside the metric it is about.
+  if (!m.previous || m.previous.minutes_share === null) return minutes;
+  return `${minutes} · לעומת ${pct(m.previous.minutes_share)} ב-${m.previous.season}`;
+}
+
+function metricTiles(m) {
+  const peers = m.goals_percentile === null
+    ? `פחות מ-${m.min_minutes_for_rank} דקות, אין השוואה`
+    : m.goals_percentile === 100
+      ? `הגבוה ביותר ב${m.age_group}`
+      : `גבוה מ-${m.goals_percentile}% מהשחקנים ב${m.age_group}`;
+  return [
+    { label: "שערים למשחק מלא", value: rate(m.goals_per_match), note: `${num(m.goals)} שערים · ${peers}` },
+    { label: "חלק משערי הקבוצה", value: pct(m.team_goal_share), note: `${num(m.goals)} מתוך ${num(m.team_goals)} שערים` },
+    { label: "חלק מהדקות האפשריות", value: pct(m.minutes_share), note: minutesShareNote(m) },
+    { label: "אחוז פתיחות", value: pct(m.start_rate), note: `${num(m.starts)} פתיחות ב-${num(m.games)} משחקים` },
+    { label: "משחקים מלאים", value: num(m.full_matches_played), note: `פתח וסיים, מתוך ${num(m.starts)} פתיחות` },
+    trendTile(m),
   ];
+}
+
+function renderTiles(player) {
+  const m = player.metrics;
+  const caption = el("tiles-caption");
+  if (m) {
+    const why = m.is_reference_season ? "" : " · העונה האחרונה שבה שיחק";
+    caption.textContent = `מדדי עונה ${m.season} · ${m.age_group}${why}`;
+  } else {
+    caption.textContent = "אין לשחקן משחקים בעונות שיש עליהן סטטיסטיקה";
+  }
+
+  const tiles = m
+    ? metricTiles(m)
+    : ["שערים למשחק מלא", "חלק משערי הקבוצה", "חלק מהדקות האפשריות", "אחוז פתיחות", "משחקים מלאים", "מגמה מול עונה קודמת"]
+        .map((label) => ({ label, value: "—", note: "" }));
 
   const container = el("tiles");
   container.replaceChildren();
@@ -484,7 +544,7 @@ function renderTiles(player) {
     label.className = "tile-label";
     label.textContent = tile.label;
     const value = document.createElement("div");
-    value.className = "tile-value";
+    value.className = `tile-value ${tile.className || ""}`.trim();
     value.textContent = tile.value;
     box.append(label, value);
     if (tile.note) {
@@ -548,7 +608,7 @@ function renderSeasons(player) {
     if (!yellows && !season.red_cards) cards.textContent = "—";
 
     row.append(seasonCell, teamCell, ageCell);
-    for (const value of [season.games, season.goals, season.minutes]) {
+    for (const value of [season.games, season.goals]) {
       const cell = document.createElement("td");
       cell.className = "num";
       cell.textContent = num(value);

@@ -75,8 +75,7 @@
         <img class="player-photo" id="player-photo" alt="" hidden>
         <div class="player-identity">
           <h2 id="player-name"></h2>
-          <p class="player-meta" id="player-meta"></p>
-          <div class="badges" id="player-badges"></div>
+          <dl class="facts" id="player-facts"></dl>
         </div>
         <div class="favorite-box">
           <button type="button" class="star-button" id="favorite-toggle" aria-pressed="false">
@@ -94,7 +93,13 @@
         </div>
       </header>
 
-      <section class="tiles" id="tiles"></section>
+      <section class="panel matches-panel" id="matches-panel" hidden>
+        <div class="panel-head">
+          <h3>משחקים אחרונים</h3>
+          <p class="hint">5 המשחקים האחרונים</p>
+        </div>
+        <div id="matches-body"></div>
+      </section>
 
       <div class="panels">
         <section class="panel map-panel">
@@ -121,7 +126,7 @@
               <thead>
                 <tr>
                   <th>עונה</th><th>קבוצה</th><th>קב׳ גיל</th>
-                  <th>מש׳</th><th>שערים</th><th>דקות</th><th>כרטיסים</th>
+                  <th>מש׳</th><th>שערים</th><th>כרטיסים</th>
                 </tr>
               </thead>
               <tbody id="seasons-body"></tbody>
@@ -130,19 +135,14 @@
         </section>
       </div>
 
-      <section class="panel matches-panel" id="matches-panel" hidden>
-        <div class="panel-head">
-          <h3>משחקים אחרונים</h3>
-          <p class="hint">5 המשחקים האחרונים</p>
-        </div>
-        <div id="matches-body"></div>
-      </section>
+      <p class="tiles-caption" id="tiles-caption"></p>
+      <section class="tiles" id="tiles"></section>
     </article>
   </main>
 </div>
 
 <script src="/static/league-filter.js"></script>
 <script src="/static/leaflet.js"></script>
-<script src="/static/app.js?v=favorites-v4"></script>
+<script src="/static/app.js?v=header-facts-v2"></script>
 </body>
 </html>
