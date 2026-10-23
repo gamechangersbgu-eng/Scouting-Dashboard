@@ -1,0 +1,6 @@
+# Club data entered in the dashboard, not part of the code.
+data/favorites.csv
+
+# Local Python environment and bytecode.
+.venv/
+__pycache__/
