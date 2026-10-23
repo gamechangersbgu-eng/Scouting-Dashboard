@@ -1,8 +1,8 @@
-"""Local scouting dashboard over the scraped youth-league data.
+"""Local scouting dashboard over the club's youth-league data.
 
-Serves a single page plus a small JSON API. Everything is read from the CSVs in data/
-once at startup and held in memory, so the dashboard needs no network access and no
-database. Run it with:
+Serves a single page plus a small JSON API. Everything is read from the normalised
+schema export in data/db/ (see dashboard/db.py) once at startup and held in memory, so
+the dashboard needs no network access and no database server. Run it with:
 
     python -m dashboard.app
 """
@@ -23,11 +23,15 @@ from datetime import datetime
 import pandas as pd
 from flask import Flask, jsonify, request, send_from_directory
 
-from ifa_scraper import config, run
+from ifa_scraper import config
+
+from .db import SEASON_STAT_FIELDS, SchemaData
 
 log = logging.getLogger(__name__)
 
 STATIC_DIR = config.PROJECT_ROOT / "dashboard" / "static"
+# The scraper keeps writing its own CSVs to data/; the dashboard reads only the schema.
+DB_DIR = config.DATA_DIR / "db"
 
 TOTAL_FIELDS = [
     "goals_total",
@@ -52,18 +56,6 @@ MIN_MINUTES_FOR_RANK = 450
 # A season becomes the reference season for the tiles once a typical team has played
 # this many games, so a season that has only just started does not hide the last one.
 MIN_TEAM_GAMES_FOR_SEASON = 10
-
-SEASON_STAT_FIELDS = [
-    "games",
-    "goals",
-    "minutes",
-    "starts",
-    "sub_on",
-    "sub_off",
-    "yellow_cards_league_cup",
-    "yellow_cards_toto",
-    "red_cards",
-]
 
 
 def _clean(value):
@@ -113,10 +105,10 @@ FAVORITES_FIELDS = ["player_id", "created_at", "notes"]
 
 
 class FavoritesStore:
-    """The scout's favourite players, persisted to ``data/favorites.csv``.
+    """The scout's favourite players, persisted to ``data/db/Favorite_Players.csv``.
 
     The file holds only what the scout adds (id, when, notes). Names and clubs are
-    joined from the scraped data when read, so they stay current after a data refresh.
+    joined from the Players and Teams tables when read, so they stay current.
     Every change rewrites the whole file, which is tiny, and the in-memory copy is only
     updated once the write has succeeded.
     """
@@ -143,14 +135,15 @@ class FavoritesStore:
 
     def _write(self, rows):
         # Write a sibling temp file and swap it in, so a crash mid-write can never
-        # leave a truncated favourites file behind. utf-8-sig lets Excel read Hebrew.
+        # leave a truncated favourites file behind. BOM and LF line ends match the
+        # SQL Server export the file came from (and the BOM lets Excel read Hebrew).
         self.path.parent.mkdir(parents=True, exist_ok=True)
         handle, temp_path = tempfile.mkstemp(
             dir=self.path.parent, prefix=".favorites-", suffix=".csv"
         )
         try:
             with os.fdopen(handle, "w", encoding="utf-8-sig", newline="") as out:
-                writer = csv.DictWriter(out, fieldnames=FAVORITES_FIELDS)
+                writer = csv.DictWriter(out, fieldnames=FAVORITES_FIELDS, lineterminator="\n")
                 writer.writeheader()
                 for player_id, row in rows.items():
                     writer.writerow({"player_id": player_id, **row})
@@ -197,23 +190,23 @@ class FavoritesStore:
 
 
 class ScoutingData:
-    """In-memory view of the scraped CSVs, indexed for per-player lookups."""
+    """In-memory view of the data/db/ schema, indexed for per-player lookups."""
 
     def __init__(self, data_dir=None):
-        self.data_dir = data_dir or config.DATA_DIR
-        self.players = self._load_players()
-        self.season_rows = self._load_season_rows()
-        self.history_rows = self._load_history_rows()
-        self.locations = self._load_locations()
-        self.details = self._load_details()
-        self.favorites = FavoritesStore(self.data_dir / "favorites.csv")
-        self.team_names = self._team_names()
-        self.competition_names = {
-            str(league_id): name for league_id, (_, name) in config.league_index().items()
-        }
-        # None (rather than empty) means the per-match file has not been produced yet,
+        self.data_dir = data_dir or DB_DIR
+        schema = SchemaData(self.data_dir)
+        self.players = schema.players
+        # Rows with statistics, and history rows whose statistics are all empty.
+        self.season_rows = schema.season_rows
+        self.history_rows = schema.history_rows
+        self.locations = schema.locations
+        self.details = schema.details
+        self.team_names = schema.team_names
+        self.competition_names = schema.competition_names
+        self.favorites = FavoritesStore(self.data_dir / "Favorite_Players.csv")
+        # None (rather than empty) means the weekly match import has not run yet,
         # which the UI reports differently from a player with no matches in it.
-        self.matches_by_player = self._load_match_rows()
+        self.matches_by_player = self._index_match_rows(schema.match_rows)
 
         self.rows_by_player = defaultdict(list)
         for row in self.season_rows:
@@ -224,10 +217,6 @@ class ScoutingData:
             self.history_by_player[row["player_id"]].append(row)
 
         self._build_season_metrics()
-
-        # Recomputed here rather than read from the CSV because players_youth.csv only
-        # carries the aggregate flag, while the season table shows a flag per spell.
-        self.natural_brackets = run.natural_age_groups(self.season_rows, self.details)
 
         self.search_index = [
             {
@@ -242,105 +231,21 @@ class ScoutingData:
                 "minutes_total": int(p.get("minutes_total") or 0),
                 "haystack": f"{p['player_name']} {p['player_id']} {_text(p.get('current_team'))}",
             }
-            for p in self.players.values()
+            # A fixed base order (top scorers first, then player id), so that results
+            # tied on the search's own sort key always come back in the same order.
+            for p in sorted(
+                self.players.values(),
+                key=lambda p: (-p["goals_total"], -p["minutes_total"], p["player_id"]),
+            )
         ]
 
-    def _load_players(self):
-        path = self.data_dir / "players_youth.csv"
-        frame = pd.read_csv(path, encoding="utf-8-sig", dtype={"player_id": str})
-        frame["birth_year"] = pd.to_numeric(frame["birth_year"], errors="coerce").astype(
-            "Int64"
-        )
-        log.info("loaded %s players", len(frame))
-        return {row["player_id"]: row for row in frame.to_dict("records")}
-
-    def _load_season_rows(self):
-        path = self.data_dir / "player_season_stats.csv"
-        frame = pd.read_csv(
-            path, encoding="utf-8-sig", dtype={"player_id": str, "team_id": str}
-        )
-        log.info("loaded %s player-season rows", len(frame))
-        return frame.to_dict("records")
-
-    def _load_history_rows(self):
-        """Load club-history rows when the historical scrape has been run.
-
-        ``player_history.csv`` intentionally contains only identity/context fields for
-        old seasons.  Recent rows are enriched with statistics later by joining them
-        to ``player_season_stats.csv`` on player, season and team id.
-        """
-        path = self.data_dir / "player_history.csv"
-        if not path.exists():
-            log.warning("%s missing; player pages will show detailed seasons only", path.name)
-            return []
-        frame = pd.read_csv(
-            path, encoding="utf-8-sig", dtype={"player_id": str, "team_id": str}
-        )
-        frame["season_id"] = pd.to_numeric(frame["season_id"], errors="coerce").astype(
-            "Int64"
-        )
-        frame = frame[frame["season_id"].notna()].copy()
-        frame["season_id"] = frame["season_id"].astype(int)
-        log.info("loaded %s historical player-team-season rows", len(frame))
-        return frame.to_dict("records")
-
-    def _load_locations(self):
-        path = self.data_dir / "team_locations.csv"
-        if not path.exists():
-            log.warning("%s missing; the map will be empty", path.name)
-            return {}
-        frame = pd.read_csv(path, encoding="utf-8-sig", dtype={"team_id": str})
-        return {row["team_id"]: row for row in frame.to_dict("records")}
-
-    def _load_details(self):
-        path = self.data_dir / "player_details.csv"
-        if not path.exists():
-            return {}
-        frame = pd.read_csv(path, encoding="utf-8-sig", dtype={"player_id": str})
-        details = {}
-        for row in frame.to_dict("records"):
-            year = _clean(row.get("birth_year"))
-            details[row["player_id"]] = {
-                "birth_year": int(year) if year is not None else None,
-            }
-        return details
-
-    def _team_names(self):
-        """Map team id -> club name from every scraped source, latest season winning."""
-        names = {}
-        for row in self.locations.values():
-            name = _text(row.get("team_name")).strip()
-            if name:
-                names[_text(row.get("team_id"))] = name
-        history = sorted(
-            self.history_rows + self.season_rows, key=lambda r: int(r["season_id"])
-        )
-        for row in history:
-            name = _text(row.get("team_name")).strip()
-            if name:
-                names[_text(row.get("team_id"))] = name
-        return names
-
-    def _load_match_rows(self):
-        """Load per-match rows, newest first per player, when the file exists.
-
-        The file is produced by the weekly update, so until then this returns None.
-        """
-        path = self.data_dir / "player_match_stats.csv"
-        if not path.exists():
-            log.info("%s missing; recent matches will show a placeholder", path.name)
+    @staticmethod
+    def _index_match_rows(frame):
+        """Index Player_Match_Stats rows newest first per player; None when empty."""
+        if frame is None:
+            log.info("Player_Match_Stats is empty; recent matches will show a placeholder")
             return None
-        id_columns = [
-            "player_id",
-            "match_id",
-            "season_id",
-            "team_id",
-            "opponent_team_id",
-            "competition_id",
-        ]
-        frame = pd.read_csv(
-            path, encoding="utf-8-sig", dtype={column: str for column in id_columns}
-        )
+        frame = frame.copy()
         # The IFA site writes dates day-first (dd/mm/yyyy); ISO dates parse either way.
         frame["match_dt"] = pd.to_datetime(
             frame["match_date"], errors="coerce", dayfirst=True, format="mixed"
@@ -447,12 +352,11 @@ class ScoutingData:
         return [{k: v for k, v in e.items() if k != "haystack"} for e in results[:limit]]
 
     def _build_season_metrics(self):
-        """Pre-aggregate player_season_stats.csv for the per-season tile metrics.
+        """Pre-aggregate Player_Season_Stats for the per-season tile metrics.
 
-        Everything here comes from the season table rather than players_youth.csv, so
-        the tiles keep working unchanged once the data moves to a normalised schema.
-        The dataset has no team fixture list, so a team's game count is taken as the
-        most games any of its players logged that season.
+        The schema has no team fixture list, so a team's game count is taken as the
+        most games any of its players logged that season. History rows (no statistics)
+        never reach this, since they are not in ``season_rows``.
         """
         team_games = defaultdict(int)
         team_goals = defaultdict(int)
@@ -475,6 +379,10 @@ class ScoutingData:
         aggregates = {}
         for row in self.season_rows:
             games = _int_or_none(row.get("games")) or 0
+            if _int_or_none(row.get("minutes")) is None:
+                # Without minutes the per-match rates would read the row as 0 minutes
+                # played; such a partially filled row is left out of the metrics.
+                games = 0
             season_id = int(row["season_id"])
             key = (row["player_id"], season_id)
             agg = aggregates.setdefault(
@@ -592,10 +500,9 @@ class ScoutingData:
     def player(self, player_id):
         """Full detail for one player, including club history before the stats window.
 
-        The recent bulk scrape provides official statistics.  The separate historical
-        scrape provides older player-team-season appearances.  They are unioned here;
-        historical-only rows deliberately expose ``None`` statistics so the UI renders
-        an em dash instead of incorrectly claiming zero appearances or goals.
+        Player_Season_Stats rows with statistics and history rows (same table, all
+        statistics empty) are unioned here; history rows deliberately expose ``None``
+        statistics so the UI renders an em dash instead of claiming zero appearances.
         """
         player = self.players.get(player_id)
         if player is None:
@@ -628,11 +535,8 @@ class ScoutingData:
             detailed = stats_by_key.get(key)
             source = detailed or row
             has_stats = detailed is not None
-            steps = (
-                run.age_groups_above(detailed, self.details, self.natural_brackets)
-                if detailed is not None
-                else None
-            )
+            # Computed for history rows too: it depends on the bracket, not the stats.
+            steps = source.get("above_age_steps")
             seasons.append(
                 {
                     "season": _text(source.get("season")),
@@ -643,8 +547,9 @@ class ScoutingData:
                     "league_name": _text(source.get("league_name")),
                     "above_age_steps": steps if steps and steps > 0 else 0,
                     "has_stats": has_stats,
+                    # A column missing from an otherwise detailed row stays None too.
                     **{
-                        field: int(detailed.get(field) or 0) if has_stats else None
+                        field: _int_or_none(detailed.get(field)) if has_stats else None
                         for field in SEASON_STAT_FIELDS
                     },
                 }
@@ -658,7 +563,7 @@ class ScoutingData:
 
         first_club = teams[0] if teams else {}
         origin = self._infer_likely_origin(teams, seasons, _clean(player.get("birth_year")))
-        current_spell = self._current_spell(stats_rows, _text(player.get("current_team")))
+        current_spell = self._current_spell(rows, _text(player.get("current_team")))
         return {
             "player_id": player_id,
             "player_name": player["player_name"],
@@ -678,9 +583,8 @@ class ScoutingData:
             "seasons": seasons[::-1],
             "teams": teams,
             "venues": venues,
-            # Exposed now so the next enhancement (origin/hometown inference) does not
-            # need another data-model change.  The city may be empty until venues are
-            # rerun after building player_history.csv.
+            # The city comes from the first club's venue; it is empty when that team
+            # has no venue in the schema.
             "first_club": first_club.get("team_name") or None,
             "first_club_city": first_club.get("city") or None,
             "first_registered_season": origin["first_registered_season"],
@@ -768,9 +672,9 @@ class ScoutingData:
             if city and city not in candidate_cities:
                 candidate_cities.append(city)
 
-        # If team_locations.csv has not yet been regenerated for historical clubs, the
-        # city is genuinely unknown.  Do not turn the club name itself into a hometown
-        # assertion here; venues.py is the authoritative club-to-locality layer.
+        # If the earliest clubs have no venue city in the schema, the city is genuinely
+        # unknown.  Do not turn the club name itself into a hometown assertion here;
+        # the Venues table is the authoritative club-to-locality layer.
         if not candidate_cities:
             return {
                 "city": None,
@@ -852,8 +756,8 @@ class ScoutingData:
         spells = {}
         for entry in seasons:
             team_id = _text(entry.get("team_id"))
-            # History rows produced by the bulk scraper normally always have a team id.
-            # Falling back to the name keeps the dashboard robust to hand-edited files.
+            # Schema rows always carry a team id (it is a foreign key). Falling back to
+            # the name keeps the dashboard robust to hand-edited files.
             key = team_id or f"name:{entry['team_name']}"
             games = int(entry.get("games") or 0)
             goals = int(entry.get("goals") or 0)
@@ -990,7 +894,8 @@ class ScoutingData:
                 for _, season in sorted(
                     {
                         (int(item["season_id"]), _text(item.get("season")))
-                        for item in (self.history_rows or self.season_rows)
+                        # Every season any row covers, with or without statistics.
+                        for item in self.season_rows + self.history_rows
                         if _text(item.get("season"))
                     },
                     reverse=True,
