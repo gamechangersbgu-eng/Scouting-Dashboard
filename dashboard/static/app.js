@@ -50,13 +50,6 @@ async function getJSON(url) {
 
 async function loadSummary() {
   const summary = await getJSON("/api/summary");
-  const historyText = summary.history_seasons?.length
-    ? ` · היסטוריה ${summary.history_seasons.at(-1)}–${summary.history_seasons[0]}`
-    : "";
-  el("dataset").textContent =
-    `${num(summary.players)} שחקנים · ${num(summary.teams_located)}/${num(summary.teams)} קבוצות מאותרות · ` +
-    `${num(summary.above_age)} משחקים מעל הגיל · סטטיסטיקה ${summary.seasons.join(", ")}${historyText}`;
-
   fillSelect(el("birth-year"), summary.birth_years, (year) => `נולדו ${year}`);
   fillSelect(el("current-team"), summary.current_teams);
   fillLocations(summary.locations || []);
@@ -468,5 +461,7 @@ el("location").addEventListener("change", loadResults);
 el("radius-km").addEventListener("change", loadResults);
 
 loadSummary().then(loadResults).catch((error) => {
+  // The dataset line is hidden normally and only surfaces to report a load failure.
   el("dataset").textContent = `שגיאה בטעינת הנתונים: ${error.message}`;
+  el("dataset").hidden = false;
 });
