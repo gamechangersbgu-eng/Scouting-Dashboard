@@ -9,7 +9,15 @@ const PIN_SINGLE = 22;
 const el = (id) => document.getElementById(id);
 const num = (value) => (value === null || value === undefined ? "—" : Number(value).toLocaleString("he-IL"));
 
-const state = { players: [], selected: null, map: null, layer: null, primed: false };
+const state = {
+  players: [],
+  selected: null,
+  player: null,
+  favorites: new Map(),
+  map: null,
+  layer: null,
+  primed: false,
+};
 
 function addLocationFilters() {
   const filters = document.querySelector(".filters");
@@ -45,6 +53,20 @@ addLocationFilters();
 async function getJSON(url) {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`${url} -> ${response.status}`);
+  return response.json();
+}
+
+async function sendJSON(method, url, body) {
+  const response = await fetch(url, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!response.ok) {
+    // 503 means favorites.csv is locked, usually because it is open in Excel.
+    const reason = response.status === 503 ? "הקובץ favorites.csv פתוח בתוכנה אחרת" : `שגיאה ${response.status}`;
+    throw new Error(reason);
+  }
   return response.json();
 }
 
@@ -140,17 +162,229 @@ function renderResults() {
   }
 }
 
+/* -------------------------------- favourites -------------------------------- */
+
+async function loadFavorites() {
+  const favorites = await getJSON("/api/favorites");
+  state.favorites = new Map(favorites.map((favorite) => [favorite.player_id, favorite]));
+  renderFavorites();
+}
+
+function renderFavorites() {
+  const list = el("favorites");
+  list.replaceChildren();
+  const count = state.favorites.size;
+  el("favorites-count").textContent = count ? `(${count})` : "";
+  el("favorites-meta").textContent = count === 1 ? "שחקן מועדף אחד" : count ? `${count} שחקנים מועדפים` : "";
+
+  if (!count) {
+    const note = document.createElement("li");
+    note.className = "empty-note";
+    note.textContent = "עדיין אין מועדפים. כדי להוסיף, לחצו על \"☆ הוספה למועדפים\" בכרטיס של שחקן.";
+    list.append(note);
+    return;
+  }
+
+  // The Map keeps the server's newest-first order, with fresh additions put in front.
+  for (const favorite of state.favorites.values()) {
+    const item = document.createElement("li");
+    if (favorite.player_id === state.selected) item.classList.add("active");
+
+    const name = document.createElement("div");
+    name.className = "result-name";
+    const label = document.createElement("span");
+    label.className = "fav-name";
+    label.textContent = favorite.player_name || `שחקן #${favorite.player_id}`;
+    name.append(label);
+    if (favorite.notes.trim()) {
+      const note = document.createElement("span");
+      note.className = "fav-note";
+      note.textContent = favorite.notes.trim().split("\n")[0];
+      note.title = favorite.notes;
+      name.append(note);
+    }
+
+    const sub = document.createElement("div");
+    sub.className = "result-sub";
+    const born = favorite.birth_year ? `נולד ${favorite.birth_year}` : "שנת לידה לא ידועה";
+    sub.textContent = `${favorite.current_team || "—"} · ${born}`;
+
+    item.append(name, sub);
+    item.addEventListener("click", () => selectPlayer(favorite.player_id));
+    list.append(item);
+  }
+}
+
+// The two header tabs swap the sidebar between search and favourites; the player card
+// on the right stays as it is, so a scout can flip views without losing their place.
+function showSidebarView(view) {
+  for (const [name, tab, panel] of [
+    ["search", el("tab-search"), el("search-view")],
+    ["favorites", el("tab-favorites"), el("favorites-view")],
+  ]) {
+    tab.setAttribute("aria-selected", String(name === view));
+    panel.hidden = name !== view;
+  }
+}
+
+function renderFavoriteControls(player) {
+  const favorite = state.favorites.get(player.player_id);
+  const button = el("favorite-toggle");
+  button.setAttribute("aria-pressed", String(Boolean(favorite)));
+  button.classList.toggle("is-favorite", Boolean(favorite));
+  button.querySelector(".star-icon").textContent = favorite ? "★" : "☆";
+  button.querySelector(".star-label").textContent = favorite ? "במועדפים" : "הוספה למועדפים";
+  button.title = favorite ? "הסרה מהמועדפים" : "הוספה למועדפים";
+
+  el("favorite-notes").hidden = !favorite;
+  el("notes-input").value = favorite ? favorite.notes : "";
+  setNotesStatus("");
+}
+
+function setNotesStatus(text, kind = "") {
+  const status = el("notes-status");
+  status.textContent = text;
+  status.className = `notes-status ${kind}`.trim();
+}
+
+async function toggleFavorite() {
+  const player = state.player;
+  if (!player) return;
+  const favorite = state.favorites.get(player.player_id);
+  try {
+    if (favorite) {
+      if (favorite.notes.trim() && !confirm("להסיר את השחקן מהמועדפים? ההערות שלו יימחקו.")) return;
+      await sendJSON("DELETE", `/api/favorites/${player.player_id}`);
+      state.favorites.delete(player.player_id);
+    } else {
+      const saved = await sendJSON("PUT", `/api/favorites/${player.player_id}`, {});
+      state.favorites = new Map([[saved.player_id, saved], ...state.favorites]);
+    }
+  } catch (error) {
+    alert(`השמירה נכשלה: ${error.message}`);
+    return;
+  }
+  renderFavorites();
+  renderFavoriteControls(player);
+  renderMatches(player);
+}
+
+async function saveNotes() {
+  const player = state.player;
+  if (!player || !state.favorites.has(player.player_id)) return;
+  const button = el("notes-save");
+  button.disabled = true;
+  try {
+    const saved = await sendJSON("PUT", `/api/favorites/${player.player_id}`, {
+      notes: el("notes-input").value,
+    });
+    state.favorites.set(saved.player_id, saved);
+    renderFavorites();
+    setNotesStatus("נשמר ✓", "ok");
+  } catch (error) {
+    setNotesStatus(`השמירה נכשלה: ${error.message}`, "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+/* ------------------------------ recent matches ------------------------------ */
+
+function formatDate(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value || "");
+  return match ? `${match[3]}/${match[2]}/${match[1]}` : value || "—";
+}
+
+async function renderMatches(player) {
+  const panel = el("matches-panel");
+  const body = el("matches-body");
+  if (!state.favorites.has(player.player_id)) {
+    panel.hidden = true;
+    body.replaceChildren();
+    return;
+  }
+  panel.hidden = false;
+
+  const result = await getJSON(`/api/player/${player.player_id}/matches`);
+  // A slow response must not paint over a player selected in the meantime.
+  if (state.selected !== player.player_id) return;
+  body.replaceChildren();
+
+  if (!result.available || !result.matches.length) {
+    const note = document.createElement("p");
+    note.className = "matches-empty";
+    note.textContent = result.available
+      ? "לא נמצאו משחקים לשחקן הזה בקובץ המשחקים."
+      : "נתוני משחקים יתעדכנו אוטומטית בעדכון השבועי";
+    body.append(note);
+    return;
+  }
+
+  const table = document.createElement("table");
+  table.className = "seasons matches";
+  table.innerHTML =
+    "<thead><tr><th>תאריך</th><th>קבוצה</th><th>יריבה</th><th>תחרות</th>" +
+    "<th>דק׳</th><th>הרכב</th><th>שערים</th><th>כרטיסים</th></tr></thead>";
+  const rows = document.createElement("tbody");
+
+  for (const match of result.matches) {
+    const row = document.createElement("tr");
+    const cells = [
+      { text: formatDate(match.match_date), className: "season-cell" },
+      { text: match.team_name || `קבוצה #${match.team_id}` },
+      { text: match.opponent_name || (match.opponent_team_id ? `קבוצה #${match.opponent_team_id}` : "—") },
+      { text: match.competition_name || (match.competition_id ? `תחרות #${match.competition_id}` : "—") },
+      { text: num(match.minutes_played), className: "num" },
+      { text: match.is_starter === null ? "—" : match.is_starter ? "פותח" : "מחליף" },
+      { text: num(match.goals), className: "num" },
+    ];
+    for (const cell of cells) {
+      const td = document.createElement("td");
+      td.textContent = cell.text;
+      if (cell.className) td.className = cell.className;
+      row.append(td);
+    }
+
+    const cards = document.createElement("td");
+    if (match.yellow_cards) {
+      const pill = document.createElement("span");
+      pill.className = "card-pill card-yellow";
+      pill.textContent = match.yellow_cards;
+      cards.append(pill);
+    }
+    if (match.red_cards) {
+      const pill = document.createElement("span");
+      pill.className = "card-pill card-red";
+      pill.textContent = match.red_cards;
+      cards.append(pill);
+    }
+    if (!match.yellow_cards && !match.red_cards) cards.textContent = "—";
+    row.append(cards);
+    rows.append(row);
+  }
+
+  table.append(rows);
+  body.append(table);
+}
+
 /* ------------------------------ player view ------------------------------ */
 
 async function selectPlayer(playerId) {
   state.selected = playerId;
   renderResults();
+  renderFavorites();
   const player = await getJSON(`/api/player/${playerId}`);
+  if (state.selected !== playerId) return;
+  state.player = player;
   el("player").hidden = false;
   renderHeader(player);
+  renderFavoriteControls(player);
   renderTiles(player);
   renderSeasons(player);
   renderMap(player);
+  renderMatches(player).catch((error) => {
+    el("matches-body").textContent = `שגיאה בטעינת המשחקים: ${error.message}`;
+  });
 }
 
 function renderHeader(player) {
@@ -459,8 +693,14 @@ el("birth-year").addEventListener("change", loadResults);
 el("current-team").addEventListener("change", loadResults);
 el("location").addEventListener("change", loadResults);
 el("radius-km").addEventListener("change", loadResults);
+el("tab-search").addEventListener("click", () => showSidebarView("search"));
+el("tab-favorites").addEventListener("click", () => showSidebarView("favorites"));
+el("favorite-toggle").addEventListener("click", toggleFavorite);
+el("notes-save").addEventListener("click", saveNotes);
+el("notes-input").addEventListener("input", () => setNotesStatus("יש שינויים שלא נשמרו", "dirty"));
 
-loadSummary().then(loadResults).catch((error) => {
+// Favourites load first so the opening player's star is already right.
+loadSummary().then(loadFavorites).then(loadResults).catch((error) => {
   // The dataset line is hidden normally and only surfaces to report a load failure.
   el("dataset").textContent = `שגיאה בטעינת הנתונים: ${error.message}`;
   el("dataset").hidden = false;

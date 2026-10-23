@@ -8,10 +8,15 @@ database. Run it with:
 """
 
 import argparse
+import csv
 import logging
 import math
+import os
+import tempfile
+import threading
 import webbrowser
 from collections import defaultdict
+from datetime import datetime
 
 import pandas as pd
 from flask import Flask, jsonify, request, send_from_directory
@@ -71,6 +76,114 @@ def _text(value):
     return "" if cleaned is None else str(cleaned)
 
 
+def _int_or_none(value):
+    """Read a numeric cell as an int, keeping a missing value as None (not zero)."""
+    cleaned = _clean(value)
+    if cleaned is None:
+        return None
+    try:
+        return int(float(cleaned))
+    except (TypeError, ValueError):
+        return None
+
+
+def _flag(value):
+    """Read a yes/no cell written as 1/0, true/false or yes/no; None when unknown."""
+    text = _text(value).strip().lower()
+    if text in {"1", "1.0", "true", "yes", "y"}:
+        return True
+    if text in {"0", "0.0", "false", "no", "n"}:
+        return False
+    return None
+
+
+FAVORITES_FIELDS = ["player_id", "created_at", "notes"]
+
+
+class FavoritesStore:
+    """The scout's favourite players, persisted to ``data/favorites.csv``.
+
+    The file holds only what the scout adds (id, when, notes). Names and clubs are
+    joined from the scraped data when read, so they stay current after a data refresh.
+    Every change rewrites the whole file, which is tiny, and the in-memory copy is only
+    updated once the write has succeeded.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self._lock = threading.Lock()
+        if not self.path.exists():
+            self._write({})
+            log.info("created %s", self.path.name)
+        self._rows = self._read()
+        log.info("loaded %s favourites", len(self._rows))
+
+    def _read(self):
+        with self.path.open(encoding="utf-8-sig", newline="") as handle:
+            return {
+                row["player_id"].strip(): {
+                    "created_at": row.get("created_at") or "",
+                    "notes": row.get("notes") or "",
+                }
+                for row in csv.DictReader(handle)
+                if (row.get("player_id") or "").strip()
+            }
+
+    def _write(self, rows):
+        # Write a sibling temp file and swap it in, so a crash mid-write can never
+        # leave a truncated favourites file behind. utf-8-sig lets Excel read Hebrew.
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle, temp_path = tempfile.mkstemp(
+            dir=self.path.parent, prefix=".favorites-", suffix=".csv"
+        )
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8-sig", newline="") as out:
+                writer = csv.DictWriter(out, fieldnames=FAVORITES_FIELDS)
+                writer.writeheader()
+                for player_id, row in rows.items():
+                    writer.writerow({"player_id": player_id, **row})
+            os.replace(temp_path, self.path)
+        except BaseException:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+            raise
+
+    def all(self):
+        with self._lock:
+            return {player_id: dict(row) for player_id, row in self._rows.items()}
+
+    def get(self, player_id):
+        with self._lock:
+            row = self._rows.get(player_id)
+            return dict(row) if row else None
+
+    def upsert(self, player_id, notes=None):
+        """Add a favourite, or update its notes; ``notes=None`` keeps existing notes."""
+        with self._lock:
+            rows = {key: dict(row) for key, row in self._rows.items()}
+            row = rows.setdefault(
+                player_id,
+                {
+                    "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                    "notes": "",
+                },
+            )
+            if notes is not None:
+                row["notes"] = notes
+            self._write(rows)
+            self._rows = rows
+            return dict(row)
+
+    def remove(self, player_id):
+        with self._lock:
+            if player_id not in self._rows:
+                return False
+            rows = {key: dict(row) for key, row in self._rows.items() if key != player_id}
+            self._write(rows)
+            self._rows = rows
+            return True
+
+
 class ScoutingData:
     """In-memory view of the scraped CSVs, indexed for per-player lookups."""
 
@@ -81,6 +194,14 @@ class ScoutingData:
         self.history_rows = self._load_history_rows()
         self.locations = self._load_locations()
         self.details = self._load_details()
+        self.favorites = FavoritesStore(self.data_dir / "favorites.csv")
+        self.team_names = self._team_names()
+        self.competition_names = {
+            str(league_id): name for league_id, (_, name) in config.league_index().items()
+        }
+        # None (rather than empty) means the per-match file has not been produced yet,
+        # which the UI reports differently from a player with no matches in it.
+        self.matches_by_player = self._load_match_rows()
 
         self.rows_by_player = defaultdict(list)
         for row in self.season_rows:
@@ -89,6 +210,7 @@ class ScoutingData:
         self.history_by_player = defaultdict(list)
         for row in self.history_rows:
             self.history_by_player[row["player_id"]].append(row)
+
 
         # Recomputed here rather than read from the CSV because players_youth.csv only
         # carries the aggregate flag, while the season table shows a flag per spell.
@@ -169,6 +291,106 @@ class ScoutingData:
                 "birth_year": int(year) if year is not None else None,
             }
         return details
+
+    def _team_names(self):
+        """Map team id -> club name from every scraped source, latest season winning."""
+        names = {}
+        for row in self.locations.values():
+            name = _text(row.get("team_name")).strip()
+            if name:
+                names[_text(row.get("team_id"))] = name
+        history = sorted(
+            self.history_rows + self.season_rows, key=lambda r: int(r["season_id"])
+        )
+        for row in history:
+            name = _text(row.get("team_name")).strip()
+            if name:
+                names[_text(row.get("team_id"))] = name
+        return names
+
+    def _load_match_rows(self):
+        """Load per-match rows, newest first per player, when the file exists.
+
+        The file is produced by the weekly update, so until then this returns None.
+        """
+        path = self.data_dir / "player_match_stats.csv"
+        if not path.exists():
+            log.info("%s missing; recent matches will show a placeholder", path.name)
+            return None
+        id_columns = [
+            "player_id",
+            "match_id",
+            "season_id",
+            "team_id",
+            "opponent_team_id",
+            "competition_id",
+        ]
+        frame = pd.read_csv(
+            path, encoding="utf-8-sig", dtype={column: str for column in id_columns}
+        )
+        # The IFA site writes dates day-first (dd/mm/yyyy); ISO dates parse either way.
+        frame["match_dt"] = pd.to_datetime(
+            frame["match_date"], errors="coerce", dayfirst=True, format="mixed"
+        )
+        frame = frame.sort_values(["match_dt", "match_id"], ascending=False, na_position="last")
+        matches = defaultdict(list)
+        for row in frame.to_dict("records"):
+            matches[_text(row.get("player_id"))].append(row)
+        log.info("loaded %s player-match rows", len(frame))
+        return matches
+
+    def recent_matches(self, player_id, limit=5):
+        if self.matches_by_player is None:
+            return {"available": False, "matches": []}
+
+        matches = []
+        for row in self.matches_by_player.get(player_id, [])[:limit]:
+            team_id = _text(row.get("team_id"))
+            opponent_id = _text(row.get("opponent_team_id"))
+            competition_id = _text(row.get("competition_id"))
+            played_on = _clean(row.get("match_dt"))
+            matches.append(
+                {
+                    "match_id": _text(row.get("match_id")),
+                    "match_date": played_on.strftime("%Y-%m-%d")
+                    if played_on is not None
+                    else _text(row.get("match_date")),
+                    "season_id": _int_or_none(row.get("season_id")),
+                    "team_id": team_id,
+                    "team_name": self.team_names.get(team_id, ""),
+                    "opponent_team_id": opponent_id,
+                    "opponent_name": self.team_names.get(opponent_id, ""),
+                    "competition_id": competition_id,
+                    "competition_name": self.competition_names.get(competition_id, ""),
+                    "minutes_played": _int_or_none(row.get("minutes_played")),
+                    "is_starter": _flag(row.get("is_starter")),
+                    "goals": _int_or_none(row.get("goals")),
+                    "yellow_cards": _int_or_none(row.get("yellow_cards")),
+                    "red_cards": _int_or_none(row.get("red_cards")),
+                }
+            )
+        return {"available": True, "matches": matches}
+
+    def favorite_entry(self, player_id, row):
+        """A favourite joined with the player's current identity from the scraped data."""
+        player = self.players.get(player_id) or {}
+        return {
+            "player_id": player_id,
+            "created_at": row["created_at"],
+            "notes": row["notes"],
+            "player_name": _text(player.get("player_name")),
+            "current_team": _text(player.get("current_team")),
+            "birth_year": _clean(player.get("birth_year")),
+        }
+
+    def favorites_list(self):
+        entries = [
+            self.favorite_entry(player_id, row)
+            for player_id, row in self.favorites.all().items()
+        ]
+        # Newest first: the player just starred is the one the scout wants to see.
+        entries.sort(key=lambda entry: entry["created_at"], reverse=True)
+        return entries
 
     def search(
         self,
@@ -645,6 +867,41 @@ def create_app(data_dir=None):
         if found is None:
             return jsonify({"error": "unknown player_id"}), 404
         return jsonify(found)
+
+    @app.get("/api/player/<player_id>/matches")
+    def player_matches(player_id):
+        if player_id not in data.players:
+            return jsonify({"error": "unknown player_id"}), 404
+        return jsonify(data.recent_matches(player_id))
+
+    @app.get("/api/favorites")
+    def favorites():
+        return jsonify(data.favorites_list())
+
+    @app.put("/api/favorites/<player_id>")
+    def save_favorite(player_id):
+        if player_id not in data.players:
+            return jsonify({"error": "unknown player_id"}), 404
+        body = request.get_json(silent=True) or {}
+        notes = body.get("notes")
+        if notes is not None and not isinstance(notes, str):
+            return jsonify({"error": "notes must be text"}), 400
+        try:
+            row = data.favorites.upsert(player_id, notes)
+        except PermissionError:
+            # Most often favorites.csv is open in Excel, which locks it on Windows.
+            return jsonify({"error": "favorites.csv is locked by another program"}), 503
+        return jsonify(data.favorite_entry(player_id, row))
+
+    @app.delete("/api/favorites/<player_id>")
+    def remove_favorite(player_id):
+        try:
+            removed = data.favorites.remove(player_id)
+        except PermissionError:
+            return jsonify({"error": "favorites.csv is locked by another program"}), 503
+        if not removed:
+            return jsonify({"error": "not a favourite"}), 404
+        return jsonify({"player_id": player_id, "removed": True})
 
     return app
 
